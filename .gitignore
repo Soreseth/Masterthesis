@@ -2,7 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+output_mia/
+run_all.sh
+run_myproj.slurm
 # C extensions
 *.so
 
