@@ -53,16 +53,21 @@ def save_dataset():
     dataset_path = "/lustre/selvaah3/hf_home/datasets/parameterlab"
 
     for dataset_name in os.listdir(dataset_path):
-        for max_length in [512, 1024, 2048]:
-            output_directory = f"{MIA_SCORE_SAVING_DIR}/{dataset_name.split('scaling_mia_the_pile_00_', 1)[1]}"
 
-            if not os.path.exists(f"{output_directory}/token_{max_length}"):
-                 os.makedirs(f"{output_directory}/token_{max_length}")
-            
-            total_dataset_path = dataset_path + "/" + dataset_name
-            members, non_members = process_dataset(total_dataset_path)
+        output_directory = f"{MIA_SCORE_SAVING_DIR}/{dataset_name.split('scaling_mia_the_pile_00_', 1)[1]}"
+        total_dataset_path = dataset_path + "/" + dataset_name
+        members, non_members = process_dataset(total_dataset_path)
 
+        if not os.path.exists(os.path.join(output_directory, "non_members")):
             non_members.save_to_disk(os.path.join(output_directory, "non_members"))
             members.save_to_disk(os.path.join(output_directory, "members"))
+
+        for max_length in [512, 1024, 2048]:
+
+            if not os.path.exists(f"{output_directory}/token_{max_length}"):
+                os.makedirs(f"{output_directory}/token_{max_length}")
         
-        print(f"Finished processing dataset {dataset_name}.")
+            else: 
+                print("Output directory already existing... ")
+
+        
