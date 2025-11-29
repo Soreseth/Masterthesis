@@ -63,8 +63,10 @@ def min_k(token_probs, ratio=0.05):
     k_length = max(1, int(len(token_probs)*ratio))
     sorted_prob = np.sort(token_probs.cpu())[:k_length]
     topk = sorted_prob[:k_length]
-    if sum(topk)==0 or k_length==0:
-        return 0
+
+    if len(topk) == 0:
+        return 0.0
+    
     return np.mean(topk).item()
 
 def min_k_plus_plus(logits, input_ids, ratio=0.05):
@@ -90,7 +92,11 @@ def min_k_plus_plus(logits, input_ids, ratio=0.05):
     mink_plus = (token_log_probs - mu) / sigma.sqrt()
     k_length = int(len(mink_plus) * ratio)
     topk = np.sort(mink_plus.cpu())[:k_length]
-    return np.mean(topk)
+
+    if len(topk) == 0:
+        return 0.0
+    
+    return np.mean(topk).item()
     
 def zlib_entropy(sentence):
     """
@@ -102,19 +108,26 @@ def ranks(logits, input_ids):
     """
     the average rank of the predicted token at each step
     """
-    labels = input_ids[:, 1:]
-    matches = (logits.argsort(-1, descending=True) == labels.unsqueeze(-1)).nonzero()
-    ranks, _ = matches[:, -1], matches[:, -2]
-    ranks = ranks.float() + 1
-    return ranks.float().mean().item()
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+    
+    # Calculate ranks on aligned tensors
+    matches = (shift_logits.argsort(-1, descending=True) == shift_labels.unsqueeze(-1)).nonzero()
+    
+    # Extract rank indices
+    ranks_indices = matches[:, -1]
+    
+    # Convert to 1-based ranking and float
+    ranks_float = ranks_indices.float() + 1
+    return ranks_float.mean().item()
 
 def get_conditional_ll(prefix_text: str, target_text: list, model, tokenizer, device):
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    prefix_encodings = tokenizer(prefix_text, return_tensors="pt")
-    target_encodings = tokenizer(target_text, return_tensors="pt")
+    prefix_encodings = tokenizer("".join(prefix_text), return_tensors="pt", truncation=True, max_length=MODEL_MAX_LENGTH)
+    target_encodings = tokenizer(target_text, return_tensors="pt", truncation=True, max_length=MODEL_MAX_LENGTH)
 
     prefix_ids = prefix_encodings.input_ids.to(device)
     target_ids = target_encodings.input_ids.to(device)
@@ -141,13 +154,16 @@ def get_conditional_ll(prefix_text: str, target_text: list, model, tokenizer, de
     return -loss.item()
 
 def process_prefix(negative_prefix: list, target_length: int, model, tokenizer) -> list:
+
     token_counts = [
-        len(tokenizer.encode(shot, truncation=True)) for shot in negative_prefix
+        len(tokenizer.encode(shot, truncation=True, max_length=MODEL_MAX_LENGTH)) for shot in negative_prefix
     ]
+
     target_token_count = target_length
     total_tokens = sum(token_counts) + target_token_count
     if total_tokens <= model.config.max_position_embeddings:
         return negative_prefix
+    
     # Determine the maximum number of shots that can fit within the max_length
     max_shots = 0
     cumulative_tokens = target_token_count
@@ -169,8 +185,9 @@ def recall(negative_prefix: list, target_text: str, model, tokenizer, device) ->
         tokenized = tokenizer(
             target_text, truncation=True, return_tensors="pt"
         ).to(device)
-        
-        joint_prefix = process_prefix(negative_prefix, len(tokenized))
+
+        seq_len = tokenized.input_ids.shape[1]
+        joint_prefix = process_prefix(negative_prefix=negative_prefix, target_length=seq_len, model=model, tokenizer=tokenizer)
 
         # get unconditional log likelihood
         labels = tokenized.input_ids
@@ -182,19 +199,25 @@ def recall(negative_prefix: list, target_text: str, model, tokenizer, device) ->
         return ll_negative / ll
     
 
-def inference(sentence, model, tokenizer):
+def inference(sentence, model, tokenizer, negative_prefix, device):
     fix_seed(0)
     loss, token_log_probs, logits, input_ids = raw_values(sentence=sentence, model=model, tokenizer=tokenizer)
     loss_lower, token_log_probs_lower, logits_lower, input_ids_lower = raw_values(sentence=sentence.lower(), model=model, tokenizer=tokenizer)
     
+
     pred = {
         'ppl': perplexity(loss=loss), 
         'ppl/lowercase_ppl': lowercase_perplexity(lowercase_ppl_val=perplexity(loss=loss_lower), original_ppl_val=perplexity(loss=loss)),
         'ppl/zlib': np.log(perplexity(loss=loss))/zlib_entropy(sentence=sentence),
-    }
+        'ranks': ranks(logits=logits, input_ids=input_ids),
+        'recall': recall(negative_prefix=negative_prefix, target_text=sentence, model=model, tokenizer=tokenizer, device=device)
+    }  
 
     for ratio in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:  
         pred[f"Min_{ratio*100}% Prob"] = min_k(token_probs=token_log_probs, ratio=ratio)
         pred[f"Min_++{ratio*100}% Prob"] = min_k_plus_plus(logits=logits, input_ids=input_ids, ratio=ratio)
 
+    # CLEANUP
+    del loss, token_log_probs, logits, input_ids, loss_lower
+    torch.cuda.empty_cache()
     return pred
