@@ -127,61 +127,57 @@ def get_conditional_ll(prefix_text: str, target_text: list, model, tokenizer, de
     if concat_ids.shape[1] > model.config.max_position_embeddings:
         excess = concat_ids.shape[1] - model.config.max_position_embeddings
         concat_ids = concat_ids[:, excess:]
+
+        # Set labels of prefix to -100
         labels = concat_ids.clone()
         labels[:, : prefix_ids.size(1) - excess] = -100
     else:
         labels = concat_ids.clone()
         labels[:, : prefix_ids.size(1)] = -100
 
-    concat_ids = concat_ids.contiguous()
-    labels = labels.contiguous()
-
     with torch.no_grad():
         outputs = model(concat_ids, labels=labels)
     loss, _ = outputs[:2]
     return -loss.item()
 
-def process_prefix(self, prefix: list, avg_length: int) -> list:
-    max_length = (
-        self.base_model.config.max_position_embeddings
-        if "mpt" not in self.base_model_name
-        else self.base_model.config.max_seq_len
-    )
+def process_prefix(negative_prefix: list, target_length: int, model, tokenizer) -> list:
     token_counts = [
-        len(self.base_tokenizer.encode(shot, truncation=True)) for shot in prefix
+        len(tokenizer.encode(shot, truncation=True)) for shot in negative_prefix
     ]
-    target_token_count = avg_length
+    target_token_count = target_length
     total_tokens = sum(token_counts) + target_token_count
-    if total_tokens <= max_length:
-        return prefix
+    if total_tokens <= model.config.max_position_embeddings:
+        return negative_prefix
     # Determine the maximum number of shots that can fit within the max_length
     max_shots = 0
     cumulative_tokens = target_token_count
     for count in token_counts:
-        if cumulative_tokens + count <= max_length:
+        if cumulative_tokens + count <= model.config.max_position_embeddings:
             max_shots += 1
             cumulative_tokens += count
         else:
             break
     # Truncate the prefix to include only the maximum number of shots
-    truncated_prefix = prefix[-max_shots:]
+    truncated_prefix = negative_prefix[-max_shots:]
     return truncated_prefix
 
-def detect(self, text: str, negative_prefix: list) -> float:
-    if len(text) == 0:
+def recall(negative_prefix: list, target_text: str, model, tokenizer, device) -> float:
+    if len(target_text) == 0:
         return 0.0
     with torch.no_grad():
-        first_device = next(self.base_model.parameters()).device
-        tokenized = self.base_tokenizer(
-            text, truncation=True, return_tensors="pt"
-        ).to(first_device)
+
+        tokenized = tokenizer(
+            target_text, truncation=True, return_tensors="pt"
+        ).to(device)
+        
+        joint_prefix = process_prefix(negative_prefix, len(tokenized))
 
         # get unconditional log likelihood
         labels = tokenized.input_ids
-        ll = -self.base_model(**tokenized, labels=labels).loss.item()
+        ll = -model(**tokenized, labels=labels).loss.item()
 
         # get conditional log likelihood with prefix
-        ll_negative = self.get_conditional_ll(text, negative_prefix)
+        ll_negative = get_conditional_ll(prefix_text=joint_prefix, target_text=target_text, model=model, tokenizer=tokenizer, device=device)
 
         return ll_negative / ll
     
