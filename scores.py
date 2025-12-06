@@ -10,6 +10,7 @@ from heapq import nlargest
 from transformers import AutoTokenizer, AutoModelForCausalLM, RobertaForMaskedLM, RobertaTokenizer
 from src.config import MODEL_MAX_LENGTH
 from sklearn.metrics import auc
+import pickle
 
 MODEL_MAX_LENGTH = 2048
 
@@ -46,7 +47,6 @@ def raw_values(sentence, model, tokenizer):
     # Get the probabilities of each word in the generated sentence by looking in the log_probs
     token_log_probs = log_probs.gather(dim=-1, index=input_ids).squeeze(-1)
     return loss, token_probs, token_log_probs, logits, encodings['input_ids']
-
 
 def perplexity(loss):
     return torch.exp(loss).item()
@@ -436,9 +436,6 @@ class MaxRenyiAttack:
         self.token_log_probs = token_log_probs
         self.input_ids_processed = input_ids[0][1:].unsqueeze(-1)
 
-    def build_freq_dist():
-        
-
     def calculateEntropy(self):
         entropies = []
         modified_entropies = []
@@ -508,7 +505,7 @@ class MaxRenyiAttack:
         }
 
 class DCPDDAttack:
-    def __init__(self, base_model_name: str, cache_dir: str):
+    def __init__(self, base_model_name: str, cache_dir: str, freq_dict_path: str):
         self.base_model_name = base_model_name
         self.cache_dir = cache_dir
         self.base_model = AutoModelForCausalLM.from_pretrained(
@@ -519,7 +516,7 @@ class DCPDDAttack:
         )
         self.base_tokenizer.pad_token_id = self.base_tokenizer.eos_token_id
         self.base_tokenizer.model_max_length = MODEL_MAX_LENGTH
-                
+        self.freq_dict_path = freq_dict_path
 
         # using the defaults of the original implementation
         self.file_num = 15
@@ -541,7 +538,7 @@ class DCPDDAttack:
         input_ids = input_ids.cpu().numpy()
         return probs, input_ids
 
-    def detect(self, text: str, freq_dist: dict) -> float:
+    def detect(self, text: str) -> float:
         if len(text) == 0:
             return 0.0
         # compute the probability distribution
@@ -555,7 +552,12 @@ class DCPDDAttack:
                 indexes.append(i)
                 current_ids.append(input_id)
 
+
         x_pro = probs[indexes]
+
+        with open(self.freq_dict_path, "rb") as f:
+            freq_dist = pickle.load(f)
+
         x_fre = np.array(freq_dist)[input_ids[indexes].tolist()]
         # To avoid zero-division:
         epsilon = 1e-10
@@ -589,7 +591,7 @@ def inference(sentence, model, tokenizer, negative_prefix, member_prefix, non_me
         'neighbourhood': neighbour_attacks.neighbourhood(text=sentence),
         'recall': rel_attacks.recall(negative_prefix=negative_prefix, target_text=sentence, model=model, tokenizer=tokenizer, device=device),
         'conrecall': rel_attacks.conrecall(target_text=sentence, member_prefix=member_prefix, non_member_prefix=non_member_prefix, model=model, tokenizer=tokenizer, device=device),
-        'dcpdd': dcpdd.detect(text=sentence, freq_dist=0.1) # Need to look into freq_dist
+        'dcpdd': dcpdd.detect(text=sentence, freq_dist="/lustre/selvaah3/projects/Masterthesis/output_mia/pythia-2.8b/GPTNeoXTokenizerFast_realnewslike_freq_dist.pkl") # Need to look into freq_dist
     }  
 
     for ratio in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:  
