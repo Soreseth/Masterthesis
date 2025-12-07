@@ -4,6 +4,7 @@ import datasets
 from datasets import load_dataset, concatenate_datasets
 import numpy as np
 import os 
+import pickle
 
 # Set offline mode to prevent internet access
 # os.environ["HF_DATASETS_OFFLINE"] = "1"
@@ -16,13 +17,20 @@ DIVISOR = 1000
 seed = random.seed() 
 rng = np.random.default_rng(seed=seed)
 
+def safe_truncate(text, max_words=100):
+    if isinstance(text, list):
+        text = " ".join(text)
+    
+    words = text.split()
+    return " ".join(words[:max_words])
+
 def create_chunks(text, tokenizer, max_length):
     """Create chunks for paragraph scales (512, 1024, 2048)."""
     tokens = tokenizer.encode(text, add_special_tokens=True)
     chunks = [tokenizer.decode(tokens[i:i+max_length], skip_special_tokens=True) for i in range(0, len(tokens), max_length)]
     return chunks
 
-def process_dataset(dataset_path):
+def mia_dataset(dataset_path: str):
     """
     Load datasets and set train datapoints as members and validation/test datapoints as non-members. 
     """
@@ -56,7 +64,7 @@ def save_dataset():
 
         output_directory = f"{MIA_SCORE_SAVING_DIR}/{dataset_name.split('scaling_mia_the_pile_00_', 1)[1]}"
         total_dataset_path = dataset_path + "/" + dataset_name
-        members, non_members = process_dataset(total_dataset_path)
+        members, non_members = mia_dataset(total_dataset_path)
 
         if not os.path.exists(os.path.join(output_directory, "non_members")):
             non_members.save_to_disk(os.path.join(output_directory, "non_members"))
@@ -70,4 +78,34 @@ def save_dataset():
             else: 
                 print("Output directory already existing... ")
 
-        
+def build_freq_dist(save_path: str, dataset_path:str, base_tokenizer):
+    """
+    Load allenai/c4-en datasets and grab all samples to determine token frequency. Then save the list  
+    """
+
+    # Dataset from MIA-Scaling
+    data = load_dataset("json", data_files={"train": f"{dataset_path}/c4-train*.json.gz", "validation": "{dataset_path}/c4-validation*.json.gz"}, streaming=True)
+
+    freq_dist = [0] * len(base_tokenizer)
+    for sample in data["train"].iter(batch_size=100000):
+        outputs = base_tokenizer(sample['text'], max_length=2048, truncation=True)
+
+        for input_ids in outputs["input_ids"]:
+            for token_id in input_ids:
+                if token_id < len(freq_dist):
+                    freq_dist[token_id] += 1
+
+    print("Frequency Distribution: Finished with train set")
+    for sample in data["validation"].iter(batch_size=100000):
+        outputs = base_tokenizer(sample['text'], max_length=2048, truncation=True)
+
+        for input_ids in outputs["input_ids"]:
+            for token_id in input_ids:
+                if token_id < len(freq_dist):
+                    freq_dist[token_id] += 1
+
+    print("Frequency Distribution: Finished with validation set")
+    print("Saving the frequency distribution to freq_dist.pkl ...")
+    # Change "/" to '/' inside the split()
+    with open(f"{save_path}/{type(base_tokenizer).__name__}_{dataset_path.split('/')[:-1]}_freq_dist.pkl", "wb") as f:
+        pickle.dump(freq_dist, f)
