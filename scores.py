@@ -12,6 +12,7 @@ from src.config import MODEL_MAX_LENGTH
 from sklearn.metrics import auc
 import pickle
 
+# os.environ["HF_HUB_OFFLINE"] = "1"
 MODEL_MAX_LENGTH = 2048
 
 def fix_seed(seed: int = 0):
@@ -36,23 +37,20 @@ def raw_values(sentence, model, tokenizer):
     # raw, unnormalized scores for every word in its vocabulary for every position in the sentence. [number of positions x size of vocubulary] matrix
     logits = outputs.logits
 
-    token_probs = F.softmax(logits[0, :-1], dim=-1)
+    full_token_probs = F.softmax(logits[0, :-1], dim=-1)
     # turn raw scores at each position to log probabilities
-    log_probs = F.log_softmax(logits[0, :-1], dim=-1)
-    
-    token_log_probs = []
+    full_log_probs = F.log_softmax(logits[0, :-1], dim=-1)
     
     input_ids = encodings['input_ids'][0][1:].unsqueeze(-1)
 
     # Get the probabilities of each word in the generated sentence by looking in the log_probs
-    token_log_probs = log_probs.gather(dim=-1, index=input_ids).squeeze(-1)
-    return loss, token_probs, token_log_probs, logits, encodings['input_ids']
+    token_log_probs = full_log_probs.gather(dim=-1, index=input_ids).squeeze(-1)
+    token_probs = full_token_probs.gather(dim=-1, index=input_ids).squeeze(-1)
+
+    return loss, token_probs, token_log_probs, logits, encodings['input_ids'], full_token_probs, full_log_probs
 
 def perplexity(loss):
     return torch.exp(loss).item()
-
-def lowercase_perplexity(lowercase_ppl_val, original_ppl_val):
-    return -(np.log(lowercase_ppl_val)/np.log(original_ppl_val)).item()
 
 def zlib_entropy(sentence):
     """
@@ -77,7 +75,7 @@ class BaselineAttacks:
         # if len(topk) == 0:
         #     return 0.0
         
-        return np.nanmean(topk).item()
+        return topk.mean().item()
 
     def min_k_plus_plus(self, ratio=0.05):
         """
@@ -92,21 +90,18 @@ class BaselineAttacks:
         # log probabilities
         log_probs = F.log_softmax(self.logits[0, :-1], dim=-1)
 
-        # token probabilities
-        token_log_probs = log_probs.gather(dim=-1, index=input_ids).squeeze(-1)
-
         # mean and variance
         mu = (probs * log_probs).sum(-1)
         sigma = (probs * torch.square(log_probs)).sum(-1) - torch.square(mu)
 
-        mink_plus = (token_log_probs - mu) / sigma.sqrt()
-        k_length = int(len(mink_plus) * ratio)
+        mink_plus = (self.token_log_probs - mu) / (sigma.sqrt() + 1e-10)
+        k_length = max(1, int(len(mink_plus) * ratio))
         topk = np.sort(mink_plus.cpu())[:k_length]
 
         # if len(topk) == 0:
         #     return 0.0
         
-        return np.nanmean(topk).item()
+        return topk.mean().item()
 
     def ranks(self):
         """
@@ -116,27 +111,20 @@ class BaselineAttacks:
         shift_labels = self.input_ids[:, 1:]
         
         # Calculate ranks on aligned tensors
-        matches = (shift_logits.argsort(-1, descending=True) == shift_labels.unsqueeze(-1)).nonzero()
+        sorted = shift_logits.argsort(-1, descending=True)
         
-        # Extract rank indices
-        ranks_indices = matches[:, -1]
+        ranks = (sorted == shift_labels.unsqueeze(-1)).nonzero(as_tuple=True)[-1]
         
         # Convert to 1-based ranking and float
-        ranks_float = ranks_indices.float() + 1
+        ranks_float = ranks.float() + 1
         return ranks_float.mean().item()
 
 
 # Adapted from https://github.com/ryuryukke/mint/blob/main/methods/recall/recall.py
 class RelativeLikelihoodAttacks:
-    def __init__(self, base_model_name: str, cache_dir: str, device):
-        self.base_model_name = base_model_name
-        self.cache_dir = cache_dir
-        self.base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_name, cache_dir=self.cache_dir, device_map="auto"
-        )
-        self.base_tokenizer = AutoTokenizer.from_pretrained(
-            self.base_model_name, cache_dir=self.cache_dir
-        )
+    def __init__(self, base_model, base_tokenizer, device):
+        self.base_model = base_model
+        self.base_tokenizer = base_tokenizer
         self.base_tokenizer.pad_token_id = self.base_tokenizer.eos_token_id
 
         self.device = device
@@ -205,7 +193,7 @@ class RelativeLikelihoodAttacks:
         
         with torch.no_grad():
             tokenized = self.base_tokenizer(
-                target_text, truncation=True, return_tensors="pt"
+                target_text, truncation=True, return_tensors="pt", max_length=MODEL_MAX_LENGTH
             ).to(self.device)
 
             seq_len = tokenized.input_ids.shape[1]
@@ -231,16 +219,16 @@ class RelativeLikelihoodAttacks:
             ).to(self.device)
 
             seq_len = tokenized.input_ids.shape[1]
-            joint_member_prefix = self.process_prefix(self, prefix=member_prefix, target_length=seq_len)
-            joint_non_member_prefix = self.process_prefix(self, prefix=non_member_prefix, target_length=seq_len)
+            joint_member_prefix = self.process_prefix(prefix=member_prefix, target_length=seq_len)
+            joint_non_member_prefix = self.process_prefix(prefix=non_member_prefix, target_length=seq_len)
 
             # get unconditional log likelihood
             labels = tokenized.input_ids
             ll = -self.base_model(**tokenized, labels=labels).loss.item()
 
             # get conditional log likelihood with prefix
-            ll_member = self.get_conditional_ll(self, prefix=joint_member_prefix, target_text=target_text)
-            ll_nonmember = self.get_conditional_ll(self, prefix=joint_non_member_prefix, target_text=target_text)
+            ll_member = self.get_conditional_ll(prefix_text=joint_member_prefix, target_text=target_text)
+            ll_nonmember = self.get_conditional_ll(prefix_text=joint_non_member_prefix, target_text=target_text)
 
             for gamma in [0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
                 scores[f"con-recall_{gamma}"] = (ll_nonmember - gamma * ll_member) / ll
@@ -249,30 +237,22 @@ class RelativeLikelihoodAttacks:
 
 # Mostly copied from https://github.com/mireshghallah/neighborhood-curvature-mia/tree/main
 class NeighbourhoodComparisonAttack:
-    def __init__(self, target_model_name: str, target_cache_dir: str, search_model_name: str, search_cache_dir: str, device):
-        self.target_model_name = target_model_name
-        self.target_cache_dir = target_cache_dir
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            self.target_model_name,
-            cache_dir=self.target_cache_dir,
-            local_files_only=False,
-            return_dict=True,
-            device_map="auto",
-            dtype=torch.float16,
-        ),
-        
-        self.target_tokenizer = AutoTokenizer.from_pretrained(
-            self.target_model_name,
-            cache_dir=self.target_cache_dir,
-            local_files_only=False,
-        ),
+    def __init__(self, target_model, target_tokenizer, search_model_name: str, search_cache_dir: str, device):
+        self.target_model = target_model
+        self.target_tokenizer = target_tokenizer
 
         self.target_tokenizer.pad_token = self.target_tokenizer.eos_token
 
         self.search_model_name = search_model_name
         self.search_cache_dir = search_cache_dir
-        self.search_model = RobertaForMaskedLM.from_pretrained(self.search_model_name, cache_dir=self.search_cache_dir, local_files_only=False,device_map="auto", dtype=torch.float16)
-        self.search_tokenizer = RobertaTokenizer.from_pretrained(self.search_model_name, cache_dir=self.search_cache_dir, local_files_only=False)
+        self.search_model = RobertaForMaskedLM.from_pretrained(
+            self.search_model_name, 
+            cache_dir=self.search_cache_dir, 
+            local_files_only=True, 
+            device_map="auto", 
+            dtype=torch.float16
+        )
+        self.search_tokenizer = RobertaTokenizer.from_pretrained(self.search_model_name, cache_dir=self.search_cache_dir, local_files_only=True)
     
         self.device = device
         self.target_model = self.target_model.to(self.device)
@@ -280,8 +260,8 @@ class NeighbourhoodComparisonAttack:
 
 
     def generate_neighbours_alt(self, text, num_word_changes=1):
-        text_tokenized = self.search_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
-        original_text = self.search_tokenizer.batch_decode(text_tokenized)[0]
+        text_tokenized = self.search_tokenizer(text, padding = True, truncation = True, max_length = 512, return_tensors='pt').input_ids.to(self.device)
+        # original_text = self.search_tokenizer.batch_decode(text_tokenized)[0]
 
         candidate_scores = dict()
         replacements = dict()
@@ -303,7 +283,6 @@ class NeighbourhoodComparisonAttack:
             for cand, prob in zip(top_candidates[0], top_probabilities[0]):
                 if not cand == target_token:
                     if original_prob.item() == 1:
-                        print("probability is one!")
                         replacements[(target_token_index, cand)] = prob.item()/(1-0.9)
                     else:
                         replacements[(target_token_index, cand)] = prob.item()/(1-original_prob.item())
@@ -352,7 +331,7 @@ class NeighbourhoodComparisonAttack:
                 # Berechne den Loss für den Nachbarn
                 neighbor_loss -= self.get_logprob(n_text) 
 
-        tok_orig = self.search_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
+        tok_orig = self.search_tokenizer(text, padding = True, truncation = True, max_length = 512, return_tensors='pt').input_ids.to(self.device)
         orig_dec = self.search_tokenizer.batch_decode(tok_orig)[0].replace(" [SEP]", " ").replace("[CLS] ", " ")
         original_loss = -self.get_logprob(orig_dec)
         
@@ -363,24 +342,10 @@ class NeighbourhoodComparisonAttack:
         return original_loss-(neighbor_loss/len(neighbours))
 
 class OfflineRobustMIA:
-    def __init__(self, target_model_name: str, target_cache_dir: str, reference_model_names_list: list[str], reference_cache_dir_list: list[str], a: float, device):
-        self.target_model_name = target_model_name
-        self.target_cache_dir = target_cache_dir
-
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            self.target_model_name,
-            cache_dir=self.target_cache_dir,
-            local_files_only=False,
-            return_dict=True,
-            device_map="auto",
-            dtype=torch.float16,
-        ),
+    def __init__(self, target_model, target_tokenizer, reference_model_names_list: list[str], reference_cache_dir_list: list[str], a: float, device):
+        self.target_model = target_model
         
-        self.target_tokenizer = AutoTokenizer.from_pretrained(
-            self.target_model_name,
-            cache_dir=self.target_cache_dir,
-            local_files_only=False,
-        ),
+        self.target_tokenizer = target_tokenizer
 
         self.reference_model_names_list = reference_model_names_list
         self.reference_cache_dir_list = reference_cache_dir_list
@@ -422,7 +387,7 @@ class OfflineRobustMIA:
         # the simulated attack to obtain the best a. Based on the result of our experiments, this optimal a remains roughly consistent 
         # across random selections of reference models. 
 
-        pr_in = 1/2((1+self.a)*average_pr_out+(1-self.a))
+        pr_in = 0.5 * ((1+self.a)*average_pr_out+(1-self.a))
 
         text_tokenized = self.target_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
         target_logprob = - self.target_model(text_tokenized, labels=text_tokenized).loss.item()
@@ -448,9 +413,11 @@ class MaxRenyiAttack:
         epsilon = 1e-10
 
         input_ids_processed = self.input_ids_processed[1:]  # Exclude the first token for processing
-        for i, token_id in enumerate(input_ids_processed):
-            token_probs = self.token_probs[i, :]  # Get the probability distribution for the i-th token
+        for i, token_id_tensor in enumerate(input_ids_processed):
+            token_id = token_id_tensor.item() 
+            token_probs = self.token_probs[i, :] 
             token_probs = token_probs.clone().detach().to(dtype=torch.float64)
+
             token_log_probs = self.token_log_probs[i, :]  # Log probabilities for entropy
             token_log_probs = token_log_probs.clone().detach().to(dtype=torch.float64)
 
@@ -477,6 +444,7 @@ class MaxRenyiAttack:
             modified_entropy = -(1 - p_y) * torch.log(torch.tensor(p_y)) - (token_probs * torch.log(1 - token_probs_safe)).sum().item() + p_y * torch.log(torch.tensor(1 - p_y)).item()
             modified_entropies.append(modified_entropy)
 
+            # Use the integer token_id for slicing
             token_probs_remaining = torch.cat((token_probs_safe[:token_id], token_probs_safe[token_id+1:]))
             
             for alpha in [0.5,2]:
@@ -505,49 +473,18 @@ class MaxRenyiAttack:
         }
 
 class DCPDDAttack:
-    def __init__(self, base_model_name: str, cache_dir: str, freq_dict_path: str):
-        self.base_model_name = base_model_name
-        self.cache_dir = cache_dir
-        self.base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_name, cache_dir=self.cache_dir, device_map="auto"
-        )
-        self.base_tokenizer = AutoTokenizer.from_pretrained(
-            self.base_model_name, cache_dir=self.cache_dir
-        )
-        self.base_tokenizer.pad_token_id = self.base_tokenizer.eos_token_id
-        self.base_tokenizer.model_max_length = MODEL_MAX_LENGTH
+    def __init__(self, freq_dict_path: str):
         self.freq_dict_path = freq_dict_path
-
-        # using the defaults of the original implementation
-        self.file_num = 15
-        self.max_tok = 1024
         self.a = 1e-10
 
-    def cal_ppl(self, text: str) -> tuple:
-        first_device = next(self.base_model.parameters()).device
-        input_ids = self.base_tokenizer.encode(text, truncation=True)
-        input_ids = torch.tensor(input_ids).unsqueeze(0)
-        input_ids = input_ids.to(first_device)
-        with torch.no_grad():
-            output = self.base_model(input_ids, labels=input_ids)
-        logit = output[1]
-        # Apply softmax to the logits to get probabilities
-        prob = torch.nn.functional.log_softmax(logit, dim=-1)[0][:-1]
-        input_ids = input_ids[0][1:]
-        probs = prob[torch.arange(len(prob)).to(first_device), input_ids].tolist()
-        input_ids = input_ids.cpu().numpy()
-        return probs, input_ids
+    def detect(self, token_probs, input_ids) -> float:
+        probs = token_probs.cpu().numpy()
+        input_ids_np = input_ids.squeeze(-1).cpu().numpy()
 
-    def detect(self, text: str) -> float:
-        if len(text) == 0:
-            return 0.0
-        # compute the probability distribution
-        probs, input_ids = self.cal_ppl(text)
         # compute the prediction score by calibrating the probability with the token frequency distribution
-        probs = np.exp(probs)
         indexes = []
         current_ids = []
-        for i, input_id in enumerate(input_ids):
+        for i, input_id in enumerate(input_ids_np):
             if input_id not in current_ids:
                 indexes.append(i)
                 current_ids.append(input_id)
@@ -566,32 +503,29 @@ class DCPDDAttack:
         ce[ce > self.a] = self.a
         return -np.mean(ce)
 
-def inference(sentence, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, device):
+def inference(sentence, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd): #neighbour_attacks,
     
     pred = {}
     fix_seed(42)
 
-    loss, token_probs, token_log_probs, logits, input_ids = raw_values(sentence=sentence, model=model, tokenizer=tokenizer)
-    loss_lower, token_log_probs_lower, logits_lower, input_ids_lower = raw_values(sentence=sentence.lower(), model=model, tokenizer=tokenizer)
+    loss, token_probs, token_log_probs, logits, input_ids, full_token_probs, full_log_probs = raw_values(sentence=sentence, model=model, tokenizer=tokenizer)
+    loss_lower, _, _, _, _, _, _  = raw_values(sentence=sentence.lower(), model=model, tokenizer=tokenizer)
     
-    rel_attacks = RelativeLikelihoodAttacks(base_model_name="EleutherAI/pythia-1b",cache_dir="models/EleutherAI__pythia-1b", device=device)
     base_attacks = BaselineAttacks(logits=logits, input_ids=input_ids, token_log_probs=token_log_probs)
-    neighbour_attacks = NeighbourhoodComparisonAttack(target_model_name="EleutherAI/pythia-1b", target_cache_dir="models/EleutherAI__pythia-1b", search_model_name="roberta-base", search_cache_dir="models/roberta_base", device=device)
-    max_renyi = MaxRenyiAttack(token_probs=token_probs, token_log_probs=token_log_probs, input_ids=input_ids)
-    dcpdd = DCPDDAttack(base_model_name="EleutherAI/pythia-1b",cache_dir="models/EleutherAI__pythia-1b")
+    max_renyi = MaxRenyiAttack(token_probs=full_token_probs, token_log_probs=full_log_probs, input_ids=input_ids)
     # Need to add RMIA !
 
 
     pred = {
         'max_renyi': max_renyi.calculateEntropy(),
         'ppl': perplexity(loss=loss), 
-        'ppl/lowercase_ppl': lowercase_perplexity(lowercase_ppl_val=perplexity(loss=loss_lower), original_ppl_val=perplexity(loss=loss)),
+        'ppl/lowercase_ppl': -(np.log(perplexity(loss))/np.log(perplexity(loss_lower))),
         'ppl/zlib': np.log(perplexity(loss=loss))/zlib_entropy(sentence=sentence),
-        'ranks': base_attacks.ranks(logits=logits, input_ids=input_ids),
-        'neighbourhood': neighbour_attacks.neighbourhood(text=sentence),
-        'recall': rel_attacks.recall(negative_prefix=negative_prefix, target_text=sentence, model=model, tokenizer=tokenizer, device=device),
-        'conrecall': rel_attacks.conrecall(target_text=sentence, member_prefix=member_prefix, non_member_prefix=non_member_prefix, model=model, tokenizer=tokenizer, device=device),
-        'dcpdd': dcpdd.detect(text=sentence, freq_dist="/lustre/selvaah3/projects/Masterthesis/output_mia/pythia-2.8b/GPTNeoXTokenizerFast_realnewslike_freq_dist.pkl") # Need to look into freq_dist
+        'ranks': base_attacks.ranks(),
+        #'neighbourhood': neighbour_attacks.neighbourhood(text=sentence),
+        'recall': rel_attacks.recall(negative_prefix=negative_prefix, target_text=sentence),
+        'conrecall': rel_attacks.conrecall(target_text=sentence, member_prefix=member_prefix, non_member_prefix=non_member_prefix),
+        'dcpdd': dcpdd.detect(token_probs=token_probs, input_ids=input_ids)
     }  
 
     for ratio in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:  
