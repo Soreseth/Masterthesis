@@ -24,7 +24,6 @@ def raw_values(sentences, model, tokenizer, device):
     """
     Used to calculate the cross-entropy and probabilities of tokens for a given sentence and model 
     """
-    # Ensure input is on the correct device
     encodings = tokenizer(
         sentences, 
         return_tensors='pt', 
@@ -99,7 +98,6 @@ def zlib_entropy(sentence):
 class BaselineAttacks:
     def __init__(self, logits, input_ids, token_log_probs):
         self.logits = logits
-        # Fix dimensions: input_ids comes as [1, 1, Seq_Len], we want [1, Seq_Len]
         if input_ids.dim() == 3 and input_ids.shape[1] == 1:
             self.input_ids = input_ids.squeeze(1)
         else:
@@ -113,7 +111,6 @@ class BaselineAttacks:
         return topk.mean().item()
 
     def min_k_plus_plus(self, ratio=0.05):
-        # FIX: No shifting needed anymore
         # Input IDs are already aligned to the logits
         input_ids = self.input_ids[0].unsqueeze(-1) # [Seq_Len, 1]
 
@@ -130,7 +127,6 @@ class BaselineAttacks:
         return topk.mean().item()
 
     def ranks(self):
-        # FIX: No shifting needed anymore.
         # logits[i] is the prediction for labels[i]
         
         logits = self.logits # [1, Seq_Len, Vocab]
@@ -301,14 +297,12 @@ class RelativeLikelihoodAttacks:
     def batch_recall(self, chunk_batch, base_losses, negative_prefix_str):
         # Repeat the prefix for the whole batch
         prefixes = [negative_prefix_str] * len(chunk_batch)
-        
-        # Run model ONCE for the whole batch
         cond_losses = self._get_batch_loss(prefixes, chunk_batch)
         
         results = []
         for i in range(len(chunk_batch)):
             ll_negative = -cond_losses[i].item()
-            ll_base = -base_losses[i] # Re-use the loss from raw_values!
+            ll_base = -base_losses[i]
             
             if ll_base == 0: 
                 results.append(0.0)
@@ -405,7 +399,7 @@ class NeighbourhoodComparisonAttack:
                         replacements[(target_token_index, cand)] = prob.item()/(1-original_prob.item())
         
         #highest_scored_texts = max(candidate_scores.iteritems(), key=operator.itemgetter(1))[:100]
-        highest_scored_texts = nlargest(100, candidate_scores, key = candidate_scores.get)
+        # highest_scored_texts = nlargest(100, candidate_scores, key = candidate_scores.get)
 
         replacement_keys = nlargest(50, replacements, key=replacements.get)
         replacements_new = dict()
@@ -445,7 +439,7 @@ class NeighbourhoodComparisonAttack:
                 # n_tuple ist (Text, SwapScore)
                 n_text = n_tuple[0].replace(" [SEP]", " ").replace("[CLS] ", " ")
                 
-                # Berechne den Loss für den Nachbarn
+                # Calculate loss for neighbours
                 neighbor_loss -= self.get_logprob(n_text) 
 
         tok_orig = self.search_tokenizer(text, padding = True, truncation = True, max_length = 512, return_tensors='pt').input_ids.to(self.device)
@@ -637,17 +631,17 @@ class DCPDDAttack:
 def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd, device):
     preds = []
     
-    # 1. Base Model Pass (Original Text) - Batched
+    # 1. Base Model Pass (Original Text)
     batch_data = raw_values(chunk_batch, model, tokenizer, device)
     
-    # Optimization: Extract base losses now to reuse in attacks
+    # Extract base losses now to reuse in attacks
     base_losses = [d['loss'].item() for d in batch_data]
     
-    # 2. Base Model Pass (Lowercase) - Batched
+    # 2. Base Model Pass (Lowercase)
     lowercase_batch = [c.lower() for c in chunk_batch]
     batch_data_lower = raw_values(lowercase_batch, model, tokenizer, device)
     
-    # 3. Rel Attacks - BATCHED (This fixes the GPU usage!)
+    # 3. Rel Attacks
     recall_scores = rel_attacks.batch_recall(chunk_batch, base_losses, negative_prefix)
     conrecall_scores = rel_attacks.batch_conrecall(chunk_batch, base_losses, member_prefix, non_member_prefix)
 
@@ -673,7 +667,7 @@ def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non
             'ppl/lowercase_ppl': -(np.log(math.exp(base_losses[i])) / np.log(math.exp(data_lower['loss'].item()))),
             'ppl/zlib': base_losses[i] / zlib_entropy(sentence),
             'ranks': base_attacks.ranks(),
-            # Insert pre-calculated batched scores
+            # TODO Neighbours batch processing 
             'recall': recall_scores[i],
             'conrecall': conrecall_scores[i],
             'dcpdd': dcpdd.detect(token_probs=data['token_probs'], input_ids=data['input_ids'])
