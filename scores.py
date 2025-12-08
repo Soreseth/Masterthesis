@@ -20,35 +20,73 @@ def fix_seed(seed: int = 0):
     np.random.seed(seed)
     random.seed(seed)
 
-def raw_values(sentence, model, tokenizer):
+def raw_values(sentences, model, tokenizer, device):
     """
     Used to calculate the cross-entropy and probabilities of tokens for a given sentence and model 
     """
     # Ensure input is on the correct device
-    encodings = tokenizer(sentence, return_tensors='pt', truncation=True, max_length=MODEL_MAX_LENGTH)
-    # if model.device.type == "cuda": v.to(model.device)
-    encodings = {k: v.to(model.device) for k, v in encodings.items()}
+    encodings = tokenizer(
+        sentences, 
+        return_tensors='pt', 
+        truncation=True, 
+        max_length=MODEL_MAX_LENGTH, 
+        padding=True
+    ).to(device)
+
+    vocab_size = model.config.vocab_size
+    
+    # Check if max ID is out of bounds
+    if encodings['input_ids'].max() >= vocab_size:
+        
+        # 1. Define the Safe Token (UNK is best, fallback to EOS)
+        safe_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else tokenizer.eos_token_id
+        
+        # 2. Create a mask of all invalid positions (True where ID is too big)
+        invalid_mask = encodings['input_ids'] >= vocab_size
+        encodings['input_ids'][invalid_mask] = safe_token_id
+
     with torch.no_grad():
-        outputs = model(**encodings, labels=encodings['input_ids'])
+        outputs = model(**encodings)
+
+    results = []
 
     # Average Cross-entropy loss over sentence. Taking the negative is the likelihood.
     loss = outputs.loss
 
     # raw, unnormalized scores for every word in its vocabulary for every position in the sentence. [number of positions x size of vocubulary] matrix
-    logits = outputs.logits
+    shift_logits = outputs.logits[..., :-1, :].contiguous()
+    shift_labels = encodings.input_ids[..., 1:].contiguous()
+    shift_attention = encodings.attention_mask[..., 1:].contiguous()
 
-    full_token_probs = F.softmax(logits[0, :-1], dim=-1)
-    # turn raw scores at each position to log probabilities
-    full_log_probs = F.log_softmax(logits[0, :-1], dim=-1)
+    batch_size = shift_labels.size(0)
+    for i in range(batch_size):
+        valid_indices = shift_attention[i] == 1
     
-    input_ids = encodings['input_ids'][0][1:].unsqueeze(-1)
+        sample_ids = shift_labels[i][valid_indices]
+        sample_logits = shift_logits[i][valid_indices]
 
-    # Get the probabilities of each word in the generated sentence by looking in the log_probs
-    token_log_probs = full_log_probs.gather(dim=-1, index=input_ids).squeeze(-1)
-    token_probs = full_token_probs.gather(dim=-1, index=input_ids).squeeze(-1)
+        # turn raw scores at each position to log probabilities
+        log_probs = F.log_softmax(sample_logits, dim=-1)
 
-    return loss, token_probs, token_log_probs, logits, encodings['input_ids'], full_token_probs, full_log_probs
+        probs = F.softmax(sample_logits, dim=-1)
+    
 
+        # Get the probabilities of each word in the generated sentence by looking in the log_probs
+        token_log_probs = log_probs.gather(dim=-1, index=sample_ids.unsqueeze(-1)).squeeze(-1)
+        token_probs = probs.gather(dim=-1, index=sample_ids.unsqueeze(-1)).squeeze(-1)
+
+        loss = -token_log_probs.mean()
+        results.append({
+                "loss": loss,
+                "token_probs": token_probs,
+                "token_log_probs": token_log_probs,
+                "logits": sample_logits.unsqueeze(0),
+                "input_ids": sample_ids.unsqueeze(0).unsqueeze(0),
+                "full_token_probs": probs,
+                "full_log_probs": log_probs
+            })
+        
+    return results
 def perplexity(loss):
     return torch.exp(loss).item()
 
@@ -61,59 +99,48 @@ def zlib_entropy(sentence):
 class BaselineAttacks:
     def __init__(self, logits, input_ids, token_log_probs):
         self.logits = logits
-        self.input_ids = input_ids
+        # Fix dimensions: input_ids comes as [1, 1, Seq_Len], we want [1, Seq_Len]
+        if input_ids.dim() == 3 and input_ids.shape[1] == 1:
+            self.input_ids = input_ids.squeeze(1)
+        else:
+            self.input_ids = input_ids
         self.token_log_probs = token_log_probs
 
     def min_k(self, ratio=0.05):
-        """
-        the average of log-likelihood of the k% tokens with lowest probabilities
-        """
         k_length = max(1, int(len(self.token_log_probs)*ratio))
         sorted_prob = np.sort(self.token_log_probs.cpu())[:k_length]
         topk = sorted_prob[:k_length]
-
-        # if len(topk) == 0:
-        #     return 0.0
-        
         return topk.mean().item()
 
     def min_k_plus_plus(self, ratio=0.05):
-        """
-        a standardized version of Min-K% over the model's vocabulary
-        """
-        # Number representation of sentence
-        input_ids = self.input_ids[0][1:].unsqueeze(-1)
+        # FIX: No shifting needed anymore
+        # Input IDs are already aligned to the logits
+        input_ids = self.input_ids[0].unsqueeze(-1) # [Seq_Len, 1]
 
-        # turn raw scores at each position to probabilities
-        probs = F.softmax(self.logits[0, :-1], dim=-1)
+        # Logits are already aligned
+        probs = F.softmax(self.logits[0], dim=-1) # [Seq_Len, Vocab]
+        log_probs = F.log_softmax(self.logits[0], dim=-1) # [Seq_Len, Vocab]
 
-        # log probabilities
-        log_probs = F.log_softmax(self.logits[0, :-1], dim=-1)
-
-        # mean and variance
         mu = (probs * log_probs).sum(-1)
         sigma = (probs * torch.square(log_probs)).sum(-1) - torch.square(mu)
 
         mink_plus = (self.token_log_probs - mu) / (sigma.sqrt() + 1e-10)
         k_length = max(1, int(len(mink_plus) * ratio))
         topk = np.sort(mink_plus.cpu())[:k_length]
-
-        # if len(topk) == 0:
-        #     return 0.0
-        
         return topk.mean().item()
 
     def ranks(self):
-        """
-        the average rank of the predicted token at each step
-        """
-        shift_logits = self.logits[:, :-1, :]
-        shift_labels = self.input_ids[:, 1:]
+        # FIX: No shifting needed anymore.
+        # logits[i] is the prediction for labels[i]
         
-        # Calculate ranks on aligned tensors
-        sorted = shift_logits.argsort(-1, descending=True)
+        logits = self.logits # [1, Seq_Len, Vocab]
+        labels = self.input_ids # [1, Seq_Len]
         
-        ranks = (sorted == shift_labels.unsqueeze(-1)).nonzero(as_tuple=True)[-1]
+        # Calculate ranks
+        sorted_idxs = logits.argsort(-1, descending=True)
+        
+        # Find where the sorted indices match the actual labels
+        ranks = (sorted_idxs == labels.unsqueeze(-1)).nonzero(as_tuple=True)[-1]
         
         # Convert to 1-based ranking and float
         ranks_float = ranks.float() + 1
@@ -130,117 +157,195 @@ class RelativeLikelihoodAttacks:
         self.device = device
         self.base_model = self.base_model.to(self.device)
 
-    def get_conditional_ll(self, prefix_text: str, target_text: list):
+    def _sanitize(self, input_ids):
+        vocab_size = self.base_model.config.vocab_size
+        if input_ids.max() >= vocab_size:
+            safe_id = self.base_tokenizer.unk_token_id if self.base_tokenizer.unk_token_id is not None else self.base_tokenizer.eos_token_id
+            input_ids[input_ids >= vocab_size] = safe_id
+        return input_ids
+    
+    def _get_batch_loss(self, prefixes, targets):
+        """
+        Calculates loss for a batch of (Prefix + Target) pairs.
+        """
+        self.base_tokenizer.padding_side = "right"
         
-        if self.base_tokenizer.pad_token is None:
-            self.base_tokenizer.pad_token = self.base_tokenizer.eos_token
+        # 1. Tokenize Prefix and Target separately to manage masking
+        prefix_enc = self.base_tokenizer(prefixes, return_tensors='pt', padding=True, truncation=True, max_length=1024)
+        target_enc = self.base_tokenizer(targets, return_tensors='pt', padding=True, truncation=True, max_length=1024, add_special_tokens=False)
+        
+        # 2. Sanitize Inputs (Crucial for stability)
+        prefix_ids = self._sanitize(prefix_enc['input_ids']).to(self.device)
+        target_ids = self._sanitize(target_enc['input_ids']).to(self.device)
+        
+        # 3. Concatenate
+        input_ids = torch.cat((prefix_ids, target_ids), dim=1)
+        
+        # 4. Build Masks
+        prefix_mask = prefix_enc.attention_mask.to(self.device)
+        target_mask = target_enc.attention_mask.to(self.device)
+        attention_mask = torch.cat((prefix_mask, target_mask), dim=1)
+        
+        # 5. Create Labels (Mask out prefix and padding)
+        labels = input_ids.clone()
+        # Mask the prefix part
+        labels[:, :prefix_ids.shape[1]] = -100 
+        # Mask the padding
+        labels[attention_mask == 0] = -100
+
+        # 6. Forward Pass (Heavy GPU work happens here)
+        with torch.no_grad():
+            outputs = self.base_model(input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+
+        # 7. Calculate Loss per Sample
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        token_losses = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        token_losses = token_losses.view(shift_labels.size())
+        
+        # Sum valid losses and divide by number of non-masked tokens
+        valid_tokens = (shift_labels != -100).sum(dim=1)
+        # Avoid div by zero
+        valid_tokens[valid_tokens == 0] = 1
+        sample_losses = token_losses.sum(dim=1) / valid_tokens
+        
+        return sample_losses
+
+    # def process_prefix(self, prefix: list, target_length: int) -> list:
+
+    #     token_counts = [
+    #         len(self.base_tokenizer.encode(shot, truncation=True, max_length=MODEL_MAX_LENGTH)) for shot in prefix
+    #     ]
+
+    #     target_token_count = target_length
+    #     total_tokens = sum(token_counts) + target_token_count
+    #     if total_tokens <= self.base_model.config.max_position_embeddings:
+    #         return prefix
+        
+    #     # Determine the maximum number of shots that can fit within the max_length
+    #     max_shots = 0
+    #     cumulative_tokens = target_token_count
+    #     for count in token_counts:
+    #         if cumulative_tokens + count <= self.base_model.config.max_position_embeddings:
+    #             max_shots += 1
+    #             cumulative_tokens += count
+    #         else:
+    #             break
+    #     # Truncate the prefix to include only the maximum number of shots
+    #     truncated_prefix = prefix[-max_shots:]
+    #     return truncated_prefix
+
+    # def recall(self, negative_prefix: list, target_text: str) -> float:
+        
+    #     if len(target_text) == 0:
+    #         return 0.0
+        
+    #     with torch.no_grad():
+    #         tokenized = self.base_tokenizer(
+    #             target_text, truncation=True, return_tensors="pt", max_length=MODEL_MAX_LENGTH
+    #         ).to(self.device)
+
+    #         vocab_size = self.base_model.config.vocab_size
+                
+    #         # Check if max ID is out of bounds
+    #         if tokenized['input_ids'].max() >= vocab_size:
+                
+    #             # 1. Define the Safe Token (UNK is best, fallback to EOS)
+    #             safe_token_id = tokenized.unk_token_id if tokenized.unk_token_id is not None else tokenizer.eos_token_id
+                
+    #             # 2. Create a mask of all invalid positions (True where ID is too big)
+    #             invalid_mask = tokenized['input_ids'] >= vocab_size
+    #             tokenized['input_ids'][invalid_mask] = safe_token_id
+
+    #         seq_len = tokenized.input_ids.shape[1]
+    #         joint_prefix = self.process_prefix(prefix=negative_prefix, target_length=seq_len)
+    #         # get unconditional log likelihood
+    #         labels = tokenized.input_ids
+    #         ll = -self.base_model(**tokenized, labels=labels).loss.item()
+
+    #         # get conditional log likelihood with prefix
+    #         ll_negative = self.get_conditional_ll(prefix_text=joint_prefix, target_text=target_text)
+
+    #         return ll_negative / ll
+        
+    # def conrecall(self, target_text:str, member_prefix: list, non_member_prefix:list) -> dict:
+        
+    #     scores = {}
+    #     if len(target_text) == 0:
+    #         return {}
+        
+    #     with torch.no_grad():
+    #         tokenized = self.base_tokenizer(
+    #             target_text, truncation=True, return_tensors="pt"
+    #         ).to(self.device)
+
+    #         seq_len = tokenized.input_ids.shape[1]
+    #         joint_member_prefix = self.process_prefix(prefix=member_prefix, target_length=seq_len)
+    #         joint_non_member_prefix = self.process_prefix(prefix=non_member_prefix, target_length=seq_len)
+
+    #         # get unconditional log likelihood
+    #         labels = tokenized.input_ids
+    #         ll = -self.base_model(**tokenized, labels=labels).loss.item()
+
+    #         # get conditional log likelihood with prefix
+    #         ll_member = self.get_conditional_ll(prefix_text=joint_member_prefix, target_text=target_text)
+    #         ll_nonmember = self.get_conditional_ll(prefix_text=joint_non_member_prefix, target_text=target_text)
+
+    #         for gamma in [0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+    #             scores[f"con-recall_{gamma}"] = (ll_nonmember - gamma * ll_member) / ll
+
+    #         return scores
+    def batch_recall(self, chunk_batch, base_losses, negative_prefix_str):
+        # Repeat the prefix for the whole batch
+        prefixes = [negative_prefix_str] * len(chunk_batch)
+        
+        # Run model ONCE for the whole batch
+        cond_losses = self._get_batch_loss(prefixes, chunk_batch)
+        
+        results = []
+        for i in range(len(chunk_batch)):
+            ll_negative = -cond_losses[i].item()
+            ll_base = -base_losses[i] # Re-use the loss from raw_values!
             
-        prefix_encodings = self.base_tokenizer("".join(prefix_text), return_tensors="pt", truncation=True, max_length=MODEL_MAX_LENGTH)
-        target_encodings = self.base_tokenizer(target_text, return_tensors="pt", truncation=True, max_length=MODEL_MAX_LENGTH)
-
-        prefix_ids = prefix_encodings.input_ids.to(self.device)
-        target_ids = target_encodings.input_ids.to(self.device)
-
-        # Concat the encodings of the prefix with the target text
-        concat_ids = torch.cat(
-            (prefix_ids, target_ids), dim=1
-        )
-
-        if concat_ids.shape[1] > self.base_model.config.max_position_embeddings:
-            excess = concat_ids.shape[1] - self.base_model.config.max_position_embeddings
-            concat_ids = concat_ids[:, excess:]
-
-            # Set labels of prefix to -100
-            labels = concat_ids.clone()
-            labels[:, : prefix_ids.size(1) - excess] = -100
-        else:
-            labels = concat_ids.clone()
-            labels[:, : prefix_ids.size(1)] = -100
-
-        with torch.no_grad():
-            outputs = self.base_model(concat_ids, labels=labels)
-        loss, _ = outputs[:2]
-        return -loss.item()
-
-    def process_prefix(self, prefix: list, target_length: int) -> list:
-
-        token_counts = [
-            len(self.base_tokenizer.encode(shot, truncation=True, max_length=MODEL_MAX_LENGTH)) for shot in prefix
-        ]
-
-        target_token_count = target_length
-        total_tokens = sum(token_counts) + target_token_count
-        if total_tokens <= self.base_model.config.max_position_embeddings:
-            return prefix
-        
-        # Determine the maximum number of shots that can fit within the max_length
-        max_shots = 0
-        cumulative_tokens = target_token_count
-        for count in token_counts:
-            if cumulative_tokens + count <= self.base_model.config.max_position_embeddings:
-                max_shots += 1
-                cumulative_tokens += count
+            if ll_base == 0: 
+                results.append(0.0)
             else:
-                break
-        # Truncate the prefix to include only the maximum number of shots
-        truncated_prefix = prefix[-max_shots:]
-        return truncated_prefix
+                results.append(ll_negative / ll_base)
+        return results
 
-    def recall(self, negative_prefix: list, target_text: str) -> float:
+    def batch_conrecall(self, chunk_batch, base_losses, member_prefix_str, non_member_prefix_str):
+        # 1. Batch Member Check
+        prefixes_mem = [member_prefix_str] * len(chunk_batch)
+        cond_loss_mem = self._get_batch_loss(prefixes_mem, chunk_batch)
         
-        if len(target_text) == 0:
-            return 0.0
+        # 2. Batch Non-Member Check
+        prefixes_non = [non_member_prefix_str] * len(chunk_batch)
+        cond_loss_non = self._get_batch_loss(prefixes_non, chunk_batch)
         
-        with torch.no_grad():
-            tokenized = self.base_tokenizer(
-                target_text, truncation=True, return_tensors="pt", max_length=MODEL_MAX_LENGTH
-            ).to(self.device)
-
-            seq_len = tokenized.input_ids.shape[1]
-            joint_prefix = self.process_prefix(prefix=negative_prefix, target_length=seq_len)
-            # get unconditional log likelihood
-            labels = tokenized.input_ids
-            ll = -self.base_model(**tokenized, labels=labels).loss.item()
-
-            # get conditional log likelihood with prefix
-            ll_negative = self.get_conditional_ll(prefix_text=joint_prefix, target_text=target_text)
-
-            return ll_negative / ll
-        
-    def conrecall(self, target_text:str, member_prefix: list, non_member_prefix:list) -> dict:
-        
-        scores = {}
-        if len(target_text) == 0:
-            return {}
-        
-        with torch.no_grad():
-            tokenized = self.base_tokenizer(
-                target_text, truncation=True, return_tensors="pt"
-            ).to(self.device)
-
-            seq_len = tokenized.input_ids.shape[1]
-            joint_member_prefix = self.process_prefix(prefix=member_prefix, target_length=seq_len)
-            joint_non_member_prefix = self.process_prefix(prefix=non_member_prefix, target_length=seq_len)
-
-            # get unconditional log likelihood
-            labels = tokenized.input_ids
-            ll = -self.base_model(**tokenized, labels=labels).loss.item()
-
-            # get conditional log likelihood with prefix
-            ll_member = self.get_conditional_ll(prefix_text=joint_member_prefix, target_text=target_text)
-            ll_nonmember = self.get_conditional_ll(prefix_text=joint_non_member_prefix, target_text=target_text)
+        results = []
+        for i in range(len(chunk_batch)):
+            ll = -base_losses[i]
+            ll_member = -cond_loss_mem[i].item()
+            ll_nonmember = -cond_loss_non[i].item()
+            
+            scores = {}
+            if ll == 0:
+                results.append({})
+                continue
 
             for gamma in [0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
                 scores[f"con-recall_{gamma}"] = (ll_nonmember - gamma * ll_member) / ll
-
-            return scores
-
+            results.append(scores)
+        return results
+    
 # Mostly copied from https://github.com/mireshghallah/neighborhood-curvature-mia/tree/main
 class NeighbourhoodComparisonAttack:
     def __init__(self, target_model, target_tokenizer, search_model_name: str, search_cache_dir: str, device):
         self.target_model = target_model
         self.target_tokenizer = target_tokenizer
-
         self.target_tokenizer.pad_token = self.target_tokenizer.eos_token
 
         self.search_model_name = search_model_name
@@ -262,6 +367,18 @@ class NeighbourhoodComparisonAttack:
     def generate_neighbours_alt(self, text, num_word_changes=1):
         text_tokenized = self.search_tokenizer(text, padding = True, truncation = True, max_length = 512, return_tensors='pt').input_ids.to(self.device)
         # original_text = self.search_tokenizer.batch_decode(text_tokenized)[0]
+
+        vocab_size = self.base_model.config.vocab_size
+            
+        # Check if max ID is out of bounds
+        if text_tokenized['input_ids'].max() >= vocab_size:
+            
+            # 1. Define the Safe Token (UNK is best, fallback to EOS)
+            safe_token_id = text_tokenized.unk_token_id if text_tokenized.unk_token_id is not None else tokenizer.eos_token_id
+            
+            # 2. Create a mask of all invalid positions (True where ID is too big)
+            invalid_mask = text_tokenized['input_ids'] >= vocab_size
+            text_tokenized['input_ids'][invalid_mask] = safe_token_id
 
         candidate_scores = dict()
         replacements = dict()
@@ -476,63 +593,96 @@ class DCPDDAttack:
     def __init__(self, freq_dict_path: str):
         self.freq_dict_path = freq_dict_path
         self.a = 1e-10
+        # Load the frequency dictionary ONCE during init to save disk I/O speed
+        with open(self.freq_dict_path, "rb") as f:
+            self.freq_dist = np.array(pickle.load(f))
 
     def detect(self, token_probs, input_ids) -> float:
-        probs = token_probs.cpu().numpy()
-        input_ids_np = input_ids.squeeze(-1).cpu().numpy()
+        if isinstance(token_probs, torch.Tensor):
+            probs = token_probs.detach().cpu().numpy().flatten()
+        else:
+            probs = token_probs.flatten()
 
-        # compute the prediction score by calibrating the probability with the token frequency distribution
+        if isinstance(input_ids, torch.Tensor):
+            # Flatten to 1D array of integers
+            input_ids_np = input_ids.detach().cpu().numpy().flatten()
+        else:
+            input_ids_np = input_ids.flatten()
+
+        # Logic to find unique token indices
         indexes = []
-        current_ids = []
+        current_ids = set() # Use set for O(1) lookup speed
         for i, input_id in enumerate(input_ids_np):
             if input_id not in current_ids:
                 indexes.append(i)
-                current_ids.append(input_id)
-
-
+                current_ids.add(input_id)
+        
         x_pro = probs[indexes]
 
-        with open(self.freq_dict_path, "rb") as f:
-            freq_dist = pickle.load(f)
-
-        x_fre = np.array(freq_dist)[input_ids[indexes].tolist()]
+        # Prevent token ID  larger than our frequency dictionary
+        valid_ids = input_ids_np[indexes]
+        max_freq_id = len(self.freq_dist) - 1
+        valid_ids = np.clip(valid_ids, 0, max_freq_id)
+        
+        x_fre = self.freq_dist[valid_ids]
+        
         # To avoid zero-division:
         epsilon = 1e-10
         x_fre = np.where(x_fre == 0, epsilon, x_fre)
+        
         ce = x_pro * np.log(1 / x_fre)
         ce[ce > self.a] = self.a
         return -np.mean(ce)
 
-def inference(sentence, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd): #neighbour_attacks,
+def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd, device):
+    preds = []
     
-    pred = {}
-    fix_seed(42)
-
-    loss, token_probs, token_log_probs, logits, input_ids, full_token_probs, full_log_probs = raw_values(sentence=sentence, model=model, tokenizer=tokenizer)
-    loss_lower, _, _, _, _, _, _  = raw_values(sentence=sentence.lower(), model=model, tokenizer=tokenizer)
+    # 1. Base Model Pass (Original Text) - Batched
+    batch_data = raw_values(chunk_batch, model, tokenizer, device)
     
-    base_attacks = BaselineAttacks(logits=logits, input_ids=input_ids, token_log_probs=token_log_probs)
-    max_renyi = MaxRenyiAttack(token_probs=full_token_probs, token_log_probs=full_log_probs, input_ids=input_ids)
-    # Need to add RMIA !
+    # Optimization: Extract base losses now to reuse in attacks
+    base_losses = [d['loss'].item() for d in batch_data]
+    
+    # 2. Base Model Pass (Lowercase) - Batched
+    lowercase_batch = [c.lower() for c in chunk_batch]
+    batch_data_lower = raw_values(lowercase_batch, model, tokenizer, device)
+    
+    # 3. Rel Attacks - BATCHED (This fixes the GPU usage!)
+    recall_scores = rel_attacks.batch_recall(chunk_batch, base_losses, negative_prefix)
+    conrecall_scores = rel_attacks.batch_conrecall(chunk_batch, base_losses, member_prefix, non_member_prefix)
 
+    # 4. Assembly Loop (Lightweight CPU work)
+    for i, sentence in enumerate(chunk_batch):
+        data = batch_data[i]
+        data_lower = batch_data_lower[i]
+        
+        base_attacks = BaselineAttacks(
+            logits=data['logits'], 
+            input_ids=data['input_ids'], 
+            token_log_probs=data['token_log_probs']
+        )
+        max_renyi = MaxRenyiAttack(
+            token_probs=data['full_token_probs'], 
+            token_log_probs=data['full_log_probs'], 
+            input_ids=data['input_ids']
+        )
+        
+        pred = {
+            'max_renyi': max_renyi.calculateEntropy(),
+            'ppl': math.exp(base_losses[i]), 
+            'ppl/lowercase_ppl': -(np.log(math.exp(base_losses[i])) / np.log(math.exp(data_lower['loss'].item()))),
+            'ppl/zlib': base_losses[i] / zlib_entropy(sentence),
+            'ranks': base_attacks.ranks(),
+            # Insert pre-calculated batched scores
+            'recall': recall_scores[i],
+            'conrecall': conrecall_scores[i],
+            'dcpdd': dcpdd.detect(token_probs=data['token_probs'], input_ids=data['input_ids'])
+        }
 
-    pred = {
-        'max_renyi': max_renyi.calculateEntropy(),
-        'ppl': perplexity(loss=loss), 
-        'ppl/lowercase_ppl': -(np.log(perplexity(loss))/np.log(perplexity(loss_lower))),
-        'ppl/zlib': np.log(perplexity(loss=loss))/zlib_entropy(sentence=sentence),
-        'ranks': base_attacks.ranks(),
-        #'neighbourhood': neighbour_attacks.neighbourhood(text=sentence),
-        'recall': rel_attacks.recall(negative_prefix=negative_prefix, target_text=sentence),
-        'conrecall': rel_attacks.conrecall(target_text=sentence, member_prefix=member_prefix, non_member_prefix=non_member_prefix),
-        'dcpdd': dcpdd.detect(token_probs=token_probs, input_ids=input_ids)
-    }  
-
-    for ratio in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:  
-        pred[f"Min_{ratio*100}% Prob"] = base_attacks.min_k(ratio=ratio)
-        pred[f"Min_++{ratio*100}% Prob"] = base_attacks.min_k_plus_plus(ratio=ratio)
-
-    # CLEANUP
-    del loss, token_log_probs, logits, input_ids, loss_lower
-    torch.cuda.empty_cache()
-    return pred
+        for ratio in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:  
+            pred[f"Min_{ratio*100}% Prob"] = base_attacks.min_k(ratio=ratio)
+            pred[f"Min_++{ratio*100}% Prob"] = base_attacks.min_k_plus_plus(ratio=ratio)
+            
+        preds.append(pred)
+        
+    return preds
