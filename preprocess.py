@@ -5,6 +5,8 @@ from datasets import load_dataset, concatenate_datasets
 import numpy as np
 import os 
 import pickle
+import torch
+import json
 
 # Set offline mode to prevent internet access
 # os.environ["HF_DATASETS_OFFLINE"] = "1"
@@ -16,6 +18,22 @@ DIVISOR = 1000
 
 seed = random.seed() 
 rng = np.random.default_rng(seed=seed)
+
+class TensorEncoder(json.JSONEncoder):
+    def default(self, obj):
+        # Handle PyTorch Tensors
+        if isinstance(obj, torch.Tensor):
+            return obj.tolist()
+        
+        # Handle Numpy Arrays
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        
+        # Handle Numpy Scalars (float32, int64, etc) -> CRITICAL FIX
+        if isinstance(obj, np.number):
+            return obj.item()
+            
+        return super().default(obj)
 
 def safe_truncate(text, max_words=100):
     if isinstance(text, list):
