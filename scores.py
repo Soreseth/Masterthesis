@@ -85,12 +85,7 @@ def raw_values(sentences, model, tokenizer, device):
                 "full_token_probs": probs,
                 "full_log_probs": log_probs
             })
-    
-    del shift_logits
-    del encodings
-    del outputs
-    torch.cuda.empty_cache()
-
+        
     return results
 def perplexity(loss):
     return torch.exp(loss).item()
@@ -155,9 +150,8 @@ class RelativeLikelihoodAttacks:
         self.base_model = base_model
         self.base_tokenizer = base_tokenizer
         self.base_tokenizer.pad_token_id = self.base_tokenizer.eos_token_id
-
         self.device = device
-        # self.base_model = self.base_model.to(self.device)
+        self.base_model = self.base_model.to(self.device)
 
     def _sanitize(self, input_ids):
         vocab_size = self.base_model.config.vocab_size
@@ -354,14 +348,14 @@ class NeighbourhoodComparisonAttack:
             self.search_model_name, 
             cache_dir=self.search_cache_dir, 
             local_files_only=True, 
-            device_map="auto",
-            torch_dtype=torch.float16
+            device_map="auto", 
+            dtype=torch.float16
         )
         self.search_tokenizer = RobertaTokenizer.from_pretrained(self.search_model_name, cache_dir=self.search_cache_dir, local_files_only=True)
     
         self.device = device
-        # self.target_model = self.target_model.to(self.device)
-        # self.search_model = self.search_model.to(self.device)
+        self.target_model = self.target_model.to(self.device)
+        self.search_model = self.search_model.to(self.device)
 
 
     def generate_neighbours_alt(self, text, num_word_changes=1):
@@ -630,7 +624,7 @@ class DCPDDAttack:
         
         ce = x_pro * np.log(1 / x_fre)
         ce[ce > self.a] = self.a
-        return -float(np.nanmean(ce))
+        return -np.mean(ce)
 
 def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd, device):
     preds = []
