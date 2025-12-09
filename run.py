@@ -3,7 +3,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import os
 import json
-from preprocess import create_chunks, save_dataset, build_freq_dist, safe_truncate
+from preprocess import create_chunks, save_dataset, build_freq_dist, safe_truncate, TensorEncoder
 from datasets import load_from_disk
 from tqdm import tqdm 
 import traceback
@@ -16,11 +16,12 @@ BATCH_SIZE = 24
 if __name__ == "__main__":
 
     model = AutoModelForCausalLM.from_pretrained(
-        f"{HF_DIR}/models/EleutherAI__pythia-6.9b",
+       f"{HF_DIR}/models/EleutherAI__pythia-6.9b",
+        cache_dir="pythia-6.9b",
         local_files_only=True,
         return_dict=True,
         device_map="auto",
-        dtype=torch.float16
+        torch_dtype=torch.float16
     )
 
     model.eval()
@@ -28,6 +29,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         f"{HF_DIR}/models/EleutherAI__pythia-6.9b",
         local_files_only=True,
+        torch_dtype=torch.float16
     )
     
     if tokenizer.pad_token is None:
@@ -50,14 +52,15 @@ if __name__ == "__main__":
 
     # Document-Level in chunk sizes of 512, 1024, 2048
     for dataset_name in os.listdir(dataset_path):
-        for max_length in [512]: # [512, 1024, 2048]
+        for max_length in [1024]: # [512, 1024, 2048]
             try:
                 # String parsing fix to be safe
                 if 'scaling_mia_the_pile_00_' not in dataset_name:
                     continue
-                    
+                
+                print(f"Processing {dataset_name} ...")
                 # distinct check: is ANY item in blocklist inside dataset_name?
-                if any(substring in dataset_name for substring in ['Pile-CC', 'OpenSubtitles', 'OpenWebText2']):
+                if any(substring in dataset_name for substring in ['Pile-CC', 'OpenSubtitles', 'OpenWebText2', "StackExchange "]):
                     print(f"Skipping {dataset_name}")
                     continue
                     
@@ -87,9 +90,7 @@ if __name__ == "__main__":
                 # save mia scores for member set
                 with open((f"{output_directory}/token_{max_length}/mia_members.jsonl"), "w") as f:
                     for dp in data_points_members:
-                        f.write(json.dumps(dp) + "\n")
-                with open((f"output_mia/checkpoint.txt"), "w") as g:
-                    g.write(f"{output_directory}/token_{max_length}/mia_members.jsonl \n")
+                        f.write(json.dumps(dp, cls=TensorEncoder) + "\n")
                 
                 # calculate mia scores for non-member set
                 data_points_nonmembers = []
@@ -98,7 +99,7 @@ if __name__ == "__main__":
                     doc_features = []
                     for i in range(0, len(all_chunks), BATCH_SIZE):
                         chunk = all_chunks[i: i+BATCH_SIZE]
-                        mia_features = inference(chunk_batch=chunk, model=model, tokenizer=tokenizer, negative_prefix=safe_truncate(members["text"][:3], 40),member_prefix=safe_truncate(members["text"][:3], 40), non_member_prefix=safe_truncate(non_members["text"][:3], 40), rel_attacks=rel_attacks,  dcpdd=dcpdd) #neighbour_attacks=neighbour_attacks,
+                        mia_features = inference(chunk_batch=chunk, model=model, tokenizer=tokenizer, negative_prefix=safe_truncate(members["text"][:3], 40),member_prefix=safe_truncate(members["text"][:3], 40), non_member_prefix=safe_truncate(non_members["text"][:3], 40), rel_attacks=rel_attacks,  dcpdd=dcpdd, device=device) #neighbour_attacks=neighbour_attacks,
                         for res in batch_features:
                             doc_features.append({'pred': res, 'label': 0})
                     data_points_nonmembers.append(doc_features)
@@ -106,10 +107,8 @@ if __name__ == "__main__":
                 # save mia scores for non-member set
                 with open((f"{output_directory}/token_{max_length}/mia_nonmembers.jsonl"), "w") as f:
                     for dp in data_points_nonmembers:
-                        f.write(json.dumps(dp) + "\n")
+                        f.write(json.dumps(dp, cls=TensorEncoder) + "\n")
                 
-                with open((f"output_mia/checkpoint.txt"), "w") as g:
-                    g.write(f"{output_directory}/token_{max_length}/mia_nonmembers.jsonl" + "\n")
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error processing {dataset_name}: {e}")
