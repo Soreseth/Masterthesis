@@ -6,12 +6,13 @@ import random
 import torch.nn.functional as F
 import os
 import numpy as np
+from numpy import nanmean
 from heapq import nlargest
 from transformers import AutoTokenizer, AutoModelForCausalLM, RobertaForMaskedLM, RobertaTokenizer
 from src.config import MODEL_MAX_LENGTH
 from sklearn.metrics import auc
 import pickle
-
+import traceback
 # os.environ["HF_HUB_OFFLINE"] = "1"
 MODEL_MAX_LENGTH = 2048
 
@@ -74,7 +75,7 @@ def raw_values(sentences, model, tokenizer, device):
         token_log_probs = log_probs.gather(dim=-1, index=sample_ids.unsqueeze(-1)).squeeze(-1)
         token_probs = probs.gather(dim=-1, index=sample_ids.unsqueeze(-1)).squeeze(-1)
 
-        loss = -token_log_probs.mean()
+        loss = -token_log_probs.nanmean()
         results.append({
                 "loss": loss,
                 "token_probs": token_probs,
@@ -84,7 +85,12 @@ def raw_values(sentences, model, tokenizer, device):
                 "full_token_probs": probs,
                 "full_log_probs": log_probs
             })
-        
+    
+    del shift_logits
+    del encodings
+    del outputs
+    torch.cuda.empty_cache()
+
     return results
 def perplexity(loss):
     return torch.exp(loss).item()
@@ -108,7 +114,7 @@ class BaselineAttacks:
         k_length = max(1, int(len(self.token_log_probs)*ratio))
         sorted_prob = np.sort(self.token_log_probs.cpu())[:k_length]
         topk = sorted_prob[:k_length]
-        return topk.mean().item()
+        return nanmean(topk).item()
 
     def min_k_plus_plus(self, ratio=0.05):
         # Input IDs are already aligned to the logits
@@ -124,7 +130,7 @@ class BaselineAttacks:
         mink_plus = (self.token_log_probs - mu) / (sigma.sqrt() + 1e-10)
         k_length = max(1, int(len(mink_plus) * ratio))
         topk = np.sort(mink_plus.cpu())[:k_length]
-        return topk.mean().item()
+        return nanmean(topk).item()
 
     def ranks(self):
         # logits[i] is the prediction for labels[i]
@@ -140,7 +146,7 @@ class BaselineAttacks:
         
         # Convert to 1-based ranking and float
         ranks_float = ranks.float() + 1
-        return ranks_float.mean().item()
+        return ranks_float.nanmean().item()
 
 
 # Adapted from https://github.com/ryuryukke/mint/blob/main/methods/recall/recall.py
@@ -151,7 +157,7 @@ class RelativeLikelihoodAttacks:
         self.base_tokenizer.pad_token_id = self.base_tokenizer.eos_token_id
 
         self.device = device
-        self.base_model = self.base_model.to(self.device)
+        # self.base_model = self.base_model.to(self.device)
 
     def _sanitize(self, input_ids):
         vocab_size = self.base_model.config.vocab_size
@@ -348,14 +354,14 @@ class NeighbourhoodComparisonAttack:
             self.search_model_name, 
             cache_dir=self.search_cache_dir, 
             local_files_only=True, 
-            device_map="auto", 
-            dtype=torch.float16
+            device_map="auto",
+            torch_dtype=torch.float16
         )
         self.search_tokenizer = RobertaTokenizer.from_pretrained(self.search_model_name, cache_dir=self.search_cache_dir, local_files_only=True)
     
         self.device = device
-        self.target_model = self.target_model.to(self.device)
-        self.search_model = self.search_model.to(self.device)
+        # self.target_model = self.target_model.to(self.device)
+        # self.search_model = self.search_model.to(self.device)
 
 
     def generate_neighbours_alt(self, text, num_word_changes=1):
@@ -368,7 +374,7 @@ class NeighbourhoodComparisonAttack:
         if text_tokenized['input_ids'].max() >= vocab_size:
             
             # 1. Define the Safe Token (UNK is best, fallback to EOS)
-            safe_token_id = text_tokenized.unk_token_id if text_tokenized.unk_token_id is not None else tokenizer.eos_token_id
+            safe_token_id = text_tokenized.unk_token_id if text_tokenized.unk_token_id is not None else self.search_tokenizer.eos_token_id
             
             # 2. Create a mask of all invalid positions (True where ID is too big)
             invalid_mask = text_tokenized['input_ids'] >= vocab_size
@@ -473,8 +479,7 @@ class OfflineRobustMIA:
                 cache_dir=self.reference_cache_dir_list[i],
                 local_files_only=False,
                 return_dict=True,
-                device_map="auto",
-                dtype=torch.float16,
+                device_map="auto"
             ),
             
             reference_tokenizer = AutoTokenizer.from_pretrained(
@@ -510,7 +515,7 @@ class MaxRenyiAttack:
     def __init__(self, token_probs, token_log_probs, input_ids):
         self.token_probs =token_probs
         self.token_log_probs = token_log_probs
-        self.input_ids_processed = input_ids[0][1:].unsqueeze(-1)
+        self.input_ids_processed = input_ids.squeeze().unsqueeze(-1)
 
     def calculateEntropy(self):
         entropies = []
@@ -523,14 +528,13 @@ class MaxRenyiAttack:
         modified_entropies_alpha2 = []
         epsilon = 1e-10
 
-        input_ids_processed = self.input_ids_processed[1:]  # Exclude the first token for processing
-        for i, token_id_tensor in enumerate(input_ids_processed):
+        for i, token_id_tensor in enumerate(self.input_ids_processed):
             token_id = token_id_tensor.item() 
             token_probs = self.token_probs[i, :] 
-            token_probs = token_probs.clone().detach().to(dtype=torch.float64)
+            token_probs = token_probs.clone().detach().to(dtype=torch.float32)
 
             token_log_probs = self.token_log_probs[i, :]  # Log probabilities for entropy
-            token_log_probs = token_log_probs.clone().detach().to(dtype=torch.float64)
+            token_log_probs = token_log_probs.clone().detach().to(dtype=torch.float32)
 
             entropy = -(token_probs * token_log_probs).sum().item()  # Calculate entropy
             entropies.append(entropy)
@@ -626,7 +630,7 @@ class DCPDDAttack:
         
         ce = x_pro * np.log(1 / x_fre)
         ce[ce > self.a] = self.a
-        return -np.mean(ce)
+        return -float(np.nanmean(ce))
 
 def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd, device):
     preds = []
