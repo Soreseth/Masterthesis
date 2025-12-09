@@ -118,7 +118,7 @@ class BaselineAttacks:
 
     def min_k_plus_plus(self, ratio=0.05):
         # Input IDs are already aligned to the logits
-        input_ids = self.input_ids[0].unsqueeze(-1) # [Seq_Len, 1]
+        # input_ids = self.input_ids[0].unsqueeze(-1) # [Seq_Len, 1]
 
         # Logits are already aligned
         probs = F.softmax(self.logits[0], dim=-1) # [Seq_Len, Vocab]
@@ -354,8 +354,7 @@ class NeighbourhoodComparisonAttack:
             self.search_model_name, 
             cache_dir=self.search_cache_dir, 
             local_files_only=True, 
-            device_map="auto",
-            torch_dtype=torch.float16
+            device_map="auto"
         )
         self.search_tokenizer = RobertaTokenizer.from_pretrained(self.search_model_name, cache_dir=self.search_cache_dir, local_files_only=True)
     
@@ -577,14 +576,17 @@ class MaxRenyiAttack:
         # loss = torch.tensor(loss)
 
         return {
-            "entropies": entropies,
-            "modified_entropies": modified_entropies,
-            "max_prob": max_prob,
-            "gap_prob": gap_prob,
-            "renyi_05": renyi_05,
-            "renyi_2": renyi_2,
-            "mod_renyi_05" : modified_entropies_alpha05,
-            "mod_renyi_2" : modified_entropies_alpha2
+            "entropies": np.nanmean(entropies),
+            "modified_entropies": np.nanmean(modified_entropies),
+            "max_prob": np.nanmean(max_prob),
+            "gap_prob": np.nanmean(gap_prob),
+            "renyi_05": np.nanmean(renyi_05),
+            "renyi_2": np.nanmean(renyi_2),
+            "mod_renyi_05": np.nanmean(modified_entropies_alpha05),
+            "mod_renyi_2": np.nanmean(modified_entropies_alpha2),
+            
+            # Optional: The negative score if you want to match the other class's style
+            "entropy_score": -np.nanmean(entropies) 
         }
 
 class DCPDDAttack:
