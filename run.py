@@ -10,26 +10,24 @@ import traceback
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 MIN_CHARS = 100
-MIA_SCORE_SAVING_DIR = "output_mia/pythia-6.9b"
+MIA_SCORE_SAVING_DIR = "output_mia/pythia-2.8b"
 HF_DIR = "/lustre/selvaah3/hf_home"
-BATCH_SIZE = 24
+BATCH_SIZE = 16
 if __name__ == "__main__":
 
     model = AutoModelForCausalLM.from_pretrained(
-       f"{HF_DIR}/models/EleutherAI__pythia-6.9b",
-        cache_dir="pythia-6.9b",
+       f"{HF_DIR}/models/EleutherAI__pythia-2.8b",
+        cache_dir="pythia-2.8b",
         local_files_only=True,
         return_dict=True,
-        device_map="auto",
-        torch_dtype=torch.float16
+        device_map="auto"
     )
 
     model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        f"{HF_DIR}/models/EleutherAI__pythia-6.9b",
-        local_files_only=True,
-        torch_dtype=torch.float16
+        f"{HF_DIR}/models/EleutherAI__pythia-2.8b",
+        local_files_only=True
     )
     
     if tokenizer.pad_token is None:
@@ -50,11 +48,23 @@ if __name__ == "__main__":
     neighbour_attacks = NeighbourhoodComparisonAttack(target_model=model, target_tokenizer=tokenizer, search_model_name="/lustre/selvaah3/hf_home/models/FacebookAI__roberta-base", search_cache_dir="/lustre/selvaah3/hf_home/models/FacebookAI__roberta-base", device=device)
     dcpdd = DCPDDAttack(freq_dict_path="/lustre/selvaah3/projects/Masterthesis/output_mia/pythia-2.8b/GPTNeoXTokenizerFast_realnewslike_freq_dist.pkl")
 
+
+    completed_configs = set()
+    if os.path.exists("output_mia/completed_log.txt"):
+        with open("output_mia/completed_log.txt", "r") as f:
+            completed_configs = set(line.strip() for line in f)
+
     # Document-Level in chunk sizes of 512, 1024, 2048
     for dataset_name in os.listdir(dataset_path):
-        for max_length in [1024]: # [512, 1024, 2048]
+        for max_length in [512, 1024, 2048]: # [512, 1024, 2048]
+
+            # Construct the log string to check
+            config_signature = f"DONE: {dataset_name} | Token: {max_length}"
+            if config_signature in completed_configs:
+                print(f"Skipping {dataset_name} {max_length} (Already Logged as Done)")
+                continue
+
             try:
-                # String parsing fix to be safe
                 if 'scaling_mia_the_pile_00_' not in dataset_name:
                     continue
                 
@@ -109,6 +119,13 @@ if __name__ == "__main__":
                     for dp in data_points_nonmembers:
                         f.write(json.dumps(dp, cls=TensorEncoder) + "\n")
                 
+                completion_log_path = "output_mia/completed_log.txt"
+                
+                with open(completion_log_path, "a") as log_file:
+                    log_file.write(f"DONE: {dataset_name} | Token: {max_length}\n")
+                
+                print(f"Finished processing {dataset_name} at {max_length} tokens.")
+
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error processing {dataset_name}: {e}")
