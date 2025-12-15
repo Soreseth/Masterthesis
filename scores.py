@@ -1,18 +1,15 @@
 import torch
+from torch import nanmean
 import numpy as np
 import zlib
 import math
 import random 
 import torch.nn.functional as F
-import os
-import numpy as np
-from numpy import nanmean
 from heapq import nlargest
-from transformers import AutoTokenizer, AutoModelForCausalLM, RobertaForMaskedLM, RobertaTokenizer
-from src.config import MODEL_MAX_LENGTH
-from sklearn.metrics import auc
+from transformers import RobertaForMaskedLM, RobertaTokenizer
+# from src.config import MODEL_MAX_LENGTH
 import pickle
-import traceback
+
 # os.environ["HF_HUB_OFFLINE"] = "1"
 MODEL_MAX_LENGTH = 2048
 
@@ -33,23 +30,10 @@ def raw_values(sentences, model, tokenizer, device):
         padding=True
     ).to(device)
 
-    vocab_size = model.config.vocab_size
-    
-    # Check if max ID is out of bounds
-    if encodings['input_ids'].max() >= vocab_size:
-        
-        # 1. Define the Safe Token (UNK is best, fallback to EOS)
-        safe_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else tokenizer.eos_token_id
-        
-        # 2. Create a mask of all invalid positions (True where ID is too big)
-        invalid_mask = encodings['input_ids'] >= vocab_size
-        encodings['input_ids'][invalid_mask] = safe_token_id
-
     with torch.no_grad():
         outputs = model(**encodings)
 
-    results = []
-
+    # results = []
     # Average Cross-entropy loss over sentence. Taking the negative is the likelihood.
     loss = outputs.loss
 
@@ -70,7 +54,6 @@ def raw_values(sentences, model, tokenizer, device):
 
         probs = F.softmax(sample_logits, dim=-1)
     
-
         # Get the probabilities of each word in the generated sentence by looking in the log_probs
         token_log_probs = log_probs.gather(dim=-1, index=sample_ids.unsqueeze(-1)).squeeze(-1)
         token_probs = probs.gather(dim=-1, index=sample_ids.unsqueeze(-1)).squeeze(-1)
@@ -89,7 +72,6 @@ def raw_values(sentences, model, tokenizer, device):
     del shift_logits
     del encodings
     del outputs
-    torch.cuda.empty_cache()
 
     return results
 def perplexity(loss):
@@ -112,8 +94,7 @@ class BaselineAttacks:
 
     def min_k(self, ratio=0.05):
         k_length = max(1, int(len(self.token_log_probs)*ratio))
-        sorted_prob = np.sort(self.token_log_probs.cpu())[:k_length]
-        topk = sorted_prob[:k_length]
+        topk, _ = torch.topk(self.token_log_probs, k_length, largest=False)
         return nanmean(topk).item()
 
     def min_k_plus_plus(self, ratio=0.05):
@@ -367,19 +348,6 @@ class NeighbourhoodComparisonAttack:
         text_tokenized = self.search_tokenizer(text, padding = True, truncation = True, max_length = 512, return_tensors='pt').input_ids.to(self.device)
         # original_text = self.search_tokenizer.batch_decode(text_tokenized)[0]
 
-        vocab_size = self.base_model.config.vocab_size
-            
-        # Check if max ID is out of bounds
-        if text_tokenized['input_ids'].max() >= vocab_size:
-            
-            # 1. Define the Safe Token (UNK is best, fallback to EOS)
-            safe_token_id = text_tokenized.unk_token_id if text_tokenized.unk_token_id is not None else self.search_tokenizer.eos_token_id
-            
-            # 2. Create a mask of all invalid positions (True where ID is too big)
-            invalid_mask = text_tokenized['input_ids'] >= vocab_size
-            text_tokenized['input_ids'][invalid_mask] = safe_token_id
-
-        candidate_scores = dict()
         replacements = dict()
         token_dropout = torch.nn.Dropout(p=0.7)
         
@@ -458,40 +426,27 @@ class NeighbourhoodComparisonAttack:
         return original_loss-(neighbor_loss/len(neighbours))
 
 class OfflineRobustMIA:
-    def __init__(self, target_model, target_tokenizer, reference_model_names_list: list[str], reference_cache_dir_list: list[str], a: float, device):
+    def __init__(self, target_model, target_tokenizer, reference_model, reference_tokenizer, a: float, device):
         self.target_model = target_model
         
         self.target_tokenizer = target_tokenizer
 
-        self.reference_model_names_list = reference_model_names_list
-        self.reference_cache_dir_list = reference_cache_dir_list
+        self.reference_model = reference_model
+        self.reference_tokenizer = reference_tokenizer
         self.a = a
         self.device = device
 
     def robustmia(self, text):
 
-        reference_likelihood = 0
+        if self.reference_tokenizer.pad_token is None:
+            self.reference_tokenizer.pad_token = self.reference_tokenizer.eos_token
+            # Some models (like GPT2) also need this to suppress warnings or errors
+            self.reference_tokenizer.pad_token_id = self.reference_tokenizer.eos_token_id
 
-        for i, model_names in enumerate(self.reference_model_names_list):
-            reference_model = AutoModelForCausalLM.from_pretrained(
-                model_names,
-                cache_dir=self.reference_cache_dir_list[i],
-                local_files_only=False,
-                return_dict=True,
-                device_map="auto"
-            ),
-            
-            reference_tokenizer = AutoTokenizer.from_pretrained(
-                model_names,
-                cache_dir=self.reference_cache_dir_list[i],
-                local_files_only=False,
-            ),
-            
-            text_tokenized = reference_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
-            logprob = - reference_model(text_tokenized, labels=text_tokenized).loss.item()
-            reference_likelihood += logprob
+        text_tokenized = self.reference_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
+        reference_likelihood = - self.reference_model(text_tokenized, labels=text_tokenized).loss.item()
 
-        average_pr_out = reference_likelihood/len(self.reference_model_names_list)
+        # average_pr_out = reference_likelihood/len(self.reference_model_names_list)
 
         # In OFFLINE mode: Estimate Pr(x)_IN with the Pr(x)_OUT. Pr(x)_OUT is the likelihood for a given sample x and model f_theta, 
         # where the model f_theta wasn't trained on the sample x. The parameter a must be optimized with the AUC score in mind. The usual 
@@ -502,7 +457,7 @@ class OfflineRobustMIA:
         # the simulated attack to obtain the best a. Based on the result of our experiments, this optimal a remains roughly consistent 
         # across random selections of reference models. 
 
-        pr_in = 0.5 * ((1+self.a)*average_pr_out+(1-self.a))
+        pr_in = 0.5 * ((1+self.a)*reference_likelihood+(1-self.a))
 
         text_tokenized = self.target_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
         target_logprob = - self.target_model(text_tokenized, labels=text_tokenized).loss.item()
@@ -512,7 +467,7 @@ class OfflineRobustMIA:
 # Mostly copied from https://github.com/LIONS-EPFL/VL-MIA/blob/main/metric_util.py
 class MaxRenyiAttack:
     def __init__(self, token_probs, token_log_probs, input_ids):
-        self.token_probs =token_probs
+        self.token_probs = token_probs
         self.token_log_probs = token_log_probs
         self.input_ids_processed = input_ids.squeeze().unsqueeze(-1)
 
@@ -634,7 +589,7 @@ class DCPDDAttack:
         ce[ce > self.a] = self.a
         return -float(np.nanmean(ce))
 
-def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, dcpdd, device):
+def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non_member_prefix, rel_attacks, neighbour_attacks, dcpdd, offline_rmia, device):
     preds = []
     
     # 1. Base Model Pass (Original Text)
@@ -673,8 +628,9 @@ def inference(chunk_batch, model, tokenizer, negative_prefix, member_prefix, non
             'ppl/lowercase_ppl': -(np.log(math.exp(base_losses[i])) / np.log(math.exp(data_lower['loss'].item()))),
             'ppl/zlib': base_losses[i] / zlib_entropy(sentence),
             'ranks': base_attacks.ranks(),
-            # TODO Neighbours batch processing 
+            'neighbourhood': neighbour_attacks.neighbourhood(text = sentence),
             'recall': recall_scores[i],
+            'rmia': offline_rmia.robustmia(text=sentence),
             'conrecall': conrecall_scores[i],
             'dcpdd': dcpdd.detect(token_probs=data['token_probs'], input_ids=data['input_ids'])
         }
