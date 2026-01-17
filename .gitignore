@@ -166,3 +166,5 @@ pythia*/
 datasets/
 output_mia/
 test.py
+job_configs.txt
+slurm.py
