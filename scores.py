@@ -447,26 +447,88 @@ class NoisyNeighbour:
 
         avg_neighbor_loss = neighbour_loss / num_batches
         return original_loss - avg_neighbor_loss
-            
+
 class OfflineRobustMIA:
-    def __init__(self, target_model, target_tokenizer, reference_model, reference_tokenizer, a: float, device):
+    def __init__(self, target_model, target_tokenizer, reference_models: list, reference_tokenizers: list, a_range: np.ndarray, gamma: float, device):
         self.target_model = target_model
         self.target_tokenizer = target_tokenizer
-        self.reference_model = reference_model
-        self.reference_tokenizer = reference_tokenizer
-        self.a = a
+        self.reference_models = reference_models
+        self.reference_tokenizers = reference_tokenizers
+        self.a_vals = a_range
+        self.gamma = gamma     
         self.device = device
+        self.population_ratios = None 
 
-    def predict(self, text:str):
-        text_tokenized = self.reference_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
-        reference_likelihood = - self.reference_model(text_tokenized, labels=text_tokenized).loss.item()
+    def _get_prob(self, model, tokenizer, text):
+        inputs = tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors='pt').to(self.device)
+        with torch.no_grad():
+            loss = model(**inputs, labels=inputs.input_ids).loss.item()
+        return np.exp(-loss)
 
-        pr_in = 0.5 * ((1+self.a)*reference_likelihood+(1-self.a))
+    def compute_ratios(self, text):
+        # 1. Pr(x | theta_target)
+        pr_target = self._get_prob(self.target_model, self.target_tokenizer, text)
+        
+        # 2. Pr(x)_OUT - Average over ALL reference models 
+        ref_probs = []
+        for model, tokenizer in zip(self.reference_models, self.reference_tokenizers):
+            prob = self._get_prob(model, tokenizer, text)
+            ref_probs.append(prob)
+        
+        # Take the mean of probabilities
+        pr_out_avg = np.mean(ref_probs)
+        
+        # 3. Approximate Pr(x)
+        pr_x_approx = 0.5 * ((1 + self.a_vals) * pr_out_avg + (1 - self.a_vals))
+        
+        return pr_target / pr_x_approx
 
-        text_tokenized = self.target_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').input_ids.to(self.device)
-        target_logprob = - self.target_model(text_tokenized, labels=text_tokenized).loss.item()
+    def precompute_population_statistics(self, population_samples: list[str]):
+        """
+        Run this ONCE. Computes ratios for all z samples.
+        """
+        print(f"Pre-computing statistics for {len(population_samples)} population samples...")
+        all_ratios = []
+        for z_text in population_samples:
+            # Returns array of shape (len(a_vals),)
+            ratios_z = self.compute_ratios(z_text)
+            all_ratios.append(ratios_z)
+        
+        # Stack into matrix: (num_samples, num_a_vals)
+        self.population_ratios = np.stack(all_ratios)
+        print("Pre-computation complete.")
 
-        return target_logprob - pr_in
+    def predict(self, target_text: str):
+        """
+        Fast prediction using pre-computed z ratios.
+        """
+        if self.population_ratios is None:
+            raise ValueError("You must call precompute_population_statistics first!")
+
+        # Step 1: Compute ratios for target sample x (Array of ratios)
+        ratios_x = self.compute_ratios(target_text)
+        
+        # Step 2 & 3: Pairwise Likelihood Ratio Test (Fully Vectorized)
+        # Broadcasting: 
+        # ratios_x shape: (num_a,) -> broadcast to (1, num_a)
+        # population_ratios shape: (num_z, num_a)
+        # Result shape: (num_z, num_a)
+        
+        lr_matrix = ratios_x / self.population_ratios
+        
+        # Check dominance: which z samples are dominated?
+        # dominated_mask shape: (num_z, num_a)
+        dominated_mask = lr_matrix > self.gamma
+        
+        # Sum down the column (summing over z samples)
+        # counts_dominated shape: (num_a,)
+        counts_dominated = dominated_mask.sum(axis=0)
+        
+        # Step 4: Final Score is fraction of z samples dominated [cite: 567]
+        num_z = self.population_ratios.shape[0]
+        scores = counts_dominated / num_z
+        
+        return {a: score for a, score in zip(self.a_vals, scores)}
     
 class MaxRenyi:
     def __init__(self, token_probs: torch.Tensor, full_log_probs: torch.Tensor, full_token_probs: torch.Tensor, epsilon: float = 1e-10):
@@ -555,9 +617,9 @@ class MaxRenyi:
             # A. Global Mean
             # Original code negates the mean for gap_prob
             if name == "gap_prob":
-                results[f"{name}_mean"] = -tensor_val.mean().item()
-            else:
                 results[f"{name}_mean"] = tensor_val.mean().item()
+            else:
+                results[f"{name}_mean"] = -tensor_val.mean().item()
             
             # B. Loop Ratios (MaxRényi-K%)
             # Only calculate ratios for the entropy metrics (including renyi_inf)
@@ -569,7 +631,7 @@ class MaxRenyi:
                     # Original code: np.sort(entropies)[-k_length:] -> Largest values
                     k_vals, _ = torch.topk(tensor_val, k_len, largest=True)
                     
-                    results[f"{name}_ratio_{int(ratio*100)}"] = k_vals.mean().item()
+                    results[f"{name}_ratio_{int(ratio*100)}"] = -k_vals.mean().item()
         
         return results
     
@@ -826,10 +888,16 @@ class ACMIA:
         
     def get_fos_mask(self):
         """Erstellt eine Maske für First Occurrence of Tokens (FOS)"""
-        input_ids_cpu = self.input_ids.cpu().numpy()
-        _, first_indices = np.unique(input_ids_cpu, return_index=True)
-        mask = np.zeros_like(input_ids_cpu, dtype=bool)
+        # FIX: Squeeze input_ids to 1D [seq_len] to calculate indices
+        input_ids_flat = self.input_ids.squeeze().cpu().numpy()
+        
+        _, first_indices = np.unique(input_ids_flat, return_index=True)
+        
+        # Create 1D mask
+        mask = np.zeros_like(input_ids_flat, dtype=bool)
         mask[first_indices] = True
+        
+        # FIX: Return 1D mask (shape: [seq_len]). Do not reshape to (1, -1).
         return torch.from_numpy(mask).to(self.device)
 
     def temperature_scaling(self):
@@ -859,7 +927,7 @@ class ACMIA:
             # Input IDs expandieren für gather
             if(number_temp != len(split_tempratures)):
                 number_temp = len(split_tempratures)
-                input_ids_expanded = self.input_ids.unsqueeze(0).expand(number_temp, -1).unsqueeze(-1)
+                input_ids_expanded = self.input_ids.expand(number_temp, -1).unsqueeze(-1)
 
             # Extrahiere Log-Probs der Ziel-Token (TSP)
             new_token_log_probs = new_log_probs.gather(dim=-1, index=input_ids_expanded).squeeze(-1)
@@ -878,15 +946,17 @@ class ACMIA:
     
     def predict(self):
         log_probs_temprature, mu_temprature, sigma_temprature = self.temperature_scaling()
+        # temps_tsp becomes shape [num_temperatures, seq_len]
         temps_tsp = np.array(log_probs_temprature)
         mu_temps = np.array(mu_temprature)
         sigma_temps = np.array(sigma_temprature)
         
-        # Original Token Log Probs (als Numpy)
+        # Original Token Log Probs (als Numpy) -> Shape [seq_len]
         orig_log_probs = self.token_log_probs.cpu().numpy()
         
         scores = defaultdict(list)
         
+        # fos_mask is now 1D -> Shape [seq_len]
         fos_mask = self.get_fos_mask().cpu().numpy()
         
         # Loop über Temperaturen
@@ -896,7 +966,8 @@ class ACMIA:
             # (TSP(tau+delta) - TSP(tau)). 
             if i > 0:
                 deriv_vals = temps_tsp[i] - temps_tsp[i-1]
-                scores[f"Temp_diff_{i}"].append(np.mean(deriv_vals[fos_mask]).item())
+                # Indexing 1D array with 1D mask works
+                scores[f"DerivAC_{tau}"].append(np.mean(deriv_vals[fos_mask]).item())
 
             # --- AC (Eq 5) ---
             # sgn(1 - tau) * (log_TSP - log_p)
@@ -909,16 +980,15 @@ class ACMIA:
             else:
                 term = diff 
             
-            scores[f"Ref_Temp_{i}"].append(np.mean(term[fos_mask]).item())
+            scores[f"AC_{tau}"].append(np.mean(term[fos_mask]).item())
 
             # --- NormAC (Eq 7) ---
             # (log_TSP - mu) / sigma
             if sigma_temps[i].any():
                 normalized = (temps_tsp[i] - mu_temps[i]) / (sigma_temps[i] + 1e-10)
-                scores[f"Normal_Temp_{i}"].append(np.mean(normalized[fos_mask]).item())
+                scores[f"NormAC_{tau}"].append(np.mean(normalized[fos_mask]).item())
                 
         return scores
-
 
 def inference(text: str, model, tokenizer, negative_prefix:torch.Tensor, member_prefix:torch.Tensor, non_member_prefix:torch.Tensor, device, rel_attacks: RelativeLikelihood, dcpdd: DCPDD, offline_rmia: OfflineRobustMIA, noisy_attack: NoisyNeighbour, tagtab_attack: TagTab, cimia_attack: CIMIA) -> dict:
     """
@@ -948,11 +1018,18 @@ def inference(text: str, model, tokenizer, negative_prefix:torch.Tensor, member_
         full_token_probs=data['full_token_probs']
     )
     
-    auto_calibration = ACMIA(device=device, logits=data['logits'], probs=data['probs'], log_probs=data['token_probs'], token_log_probs=data['token_log_probs'], input_ids=data['input_ids'], temperatures=np.concatenate([
-        np.arange(0.1, 1.0, 0.2),  # "Overfitting"-Simulation (<1)
-        np.arange(1.0, 3.0, 0.5)  # "Underfitting"-Simulation (>1)
-    ]))
-    
+    auto_calibration = ACMIA(
+        device=device, 
+        logits=data['logits'], 
+        probs=data['full_token_probs'], 
+        log_probs=data['full_log_probs'], 
+        token_log_probs=data['token_log_probs'], 
+        input_ids=data['input_ids'], 
+        temperatures=np.concatenate([
+            np.arange(0.1, 1.0, 0.2), 
+            np.arange(1.0, 3.0, 0.5) 
+        ])
+    )
     
     pred = {
         **max_renyi.predict(), 
@@ -962,7 +1039,7 @@ def inference(text: str, model, tokenizer, negative_prefix:torch.Tensor, member_
         'ranks': -base_attacks.ranks(), 
         'dcpdd': dcpdd.predict(token_probs=token_probs_1d, input_ids=input_ids_1d),
         'tagtab': tagtab_attack.predict(text=text),
-        'cimia': cimia_attack.predict(loss=base_loss, input_ids=input_ids_1d, token_log_probs=data['token_log_probs']),
+        'cimia': -cimia_attack.predict(loss=base_loss, input_ids=input_ids_1d, token_log_probs=data['token_log_probs']),
         'acmia': auto_calibration.predict()
     }
     
@@ -977,13 +1054,13 @@ def inference(text: str, model, tokenizer, negative_prefix:torch.Tensor, member_
     # del base_attacks             
     # del max_renyi                
     
-    pred['noisy_neighbourhood'] = noisy_attack.predict(
+    pred['noisy_neighbourhood'] = -noisy_attack.predict(
         input_ids=data['input_ids'], 
         base_loss=base_loss, 
         num_of_neighbour=20
     )
     
-    pred['rmia'] = offline_rmia.predict(text=text)
+    pred['rmia'] = offline_rmia.predict(target_text=text)
     
     if input_ids_1d.numel() <= MODEL_MAX_LENGTH:
         pred['recall'] = -rel_attacks.calc_recall(text, base_loss, negative_prefix)

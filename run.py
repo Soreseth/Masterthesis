@@ -4,7 +4,7 @@ import torch
 import os
 import json
 import time
-from preprocess import create_chunks, save_dataset, build_freq_dist, safe_pre_encode_shots, TensorEncoder, collect_calibration_signals
+from preprocess import create_chunks, save_dataset, build_freq_dist, safe_pre_encode_shots, TensorEncoder, collect_calibration_signals, topPref
 from datasets import load_from_disk
 from tqdm import tqdm
 import traceback
@@ -54,31 +54,50 @@ def main(pythia_model: str, max_length: int, miaset: str, dataset: str, dataset_
     
     model.config.pad_token_id = tokenizer.pad_token_id
     
-    if pythia_model == "pythia-2.8b":
-        reference_model_name = "pythia-1.4b"
-    elif pythia_model == "pythia-6.9b":
-        reference_model_name = "pythia-1.4b"
-    else:
-        reference_model_name = "pythia-1.4b" 
+    # if pythia_model == "pythia-2.8b":
+    #     reference_model_name = "pythia-1.4b"
+    # elif pythia_model == "pythia-6.9b":
+    #     reference_model_name = "pythia-1.4b"
+    # else:
+    #     reference_model_name = "pythia-1.4b" 
 
-    reference_model = AutoModelForCausalLM.from_pretrained(
-        f"{HF_DIR}/models/EleutherAI__{reference_model_name}",
+    reference_model_1 = AutoModelForCausalLM.from_pretrained(
+        f"{HF_DIR}/models/EleutherAI__pythia-1.4b",
         local_files_only=False,
         return_dict=True,
         device_map="auto",
         torch_dtype=torch.float16
     )
         
-    reference_model.eval()
+    reference_model_1.eval()
     
-    reference_tokenizer = AutoTokenizer.from_pretrained(
-        f"{HF_DIR}/models/EleutherAI__{reference_model_name}",
+    reference_tokenizer_1 = AutoTokenizer.from_pretrained(
+        f"{HF_DIR}/models/EleutherAI__pythia-1.4b",
         local_files_only=False,
     )
 
-    if reference_tokenizer.pad_token is None:
-        reference_tokenizer.pad_token = reference_tokenizer.eos_token
-    reference_tokenizer.pad_token_id = reference_tokenizer.eos_token_id 
+    if reference_tokenizer_1.pad_token is None:
+        reference_tokenizer_1.pad_token = reference_tokenizer_1.eos_token
+    reference_tokenizer_1.pad_token_id = reference_tokenizer_1.eos_token_id 
+
+    reference_model_2 = AutoModelForCausalLM.from_pretrained(
+        f"{HF_DIR}/models/EleutherAI__pythia-1b",
+        local_files_only=False,
+        return_dict=True,
+        device_map="auto",
+        torch_dtype=torch.float16
+    )
+        
+    reference_model_2.eval()
+    
+    reference_tokenizer_2 = AutoTokenizer.from_pretrained(
+        f"{HF_DIR}/models/EleutherAI__pythia-1b",
+        local_files_only=False,
+    )
+
+    if reference_tokenizer_2.pad_token is None:
+        reference_tokenizer_2.pad_token = reference_tokenizer_2.eos_token
+    reference_tokenizer_2.pad_token_id = reference_tokenizer_2.eos_token_id 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -110,8 +129,8 @@ def main(pythia_model: str, max_length: int, miaset: str, dataset: str, dataset_
         calibration_signal = json.load(f)
 
     # 3. Calculate num_signals for indexing
-    non_member_dataset = load_from_disk(f"{output_directory}/non_members")
-    num_signals = min(int(len(non_member_dataset) * 0.5), 1000)
+    non_members = load_from_disk(dataset_path=f"{output_directory}/non_members")
+    num_signals = min(int(len(non_members['text']) * 0.5), 1000)
     
     rel_attacks = RelativeLikelihood(base_model=model, base_tokenizer=tokenizer, device=device)
     
@@ -120,10 +139,39 @@ def main(pythia_model: str, max_length: int, miaset: str, dataset: str, dataset_
         freq_dict = np.array(pickle.load(f), dtype=np.float32)
         
     dcpdd = DCPDD(freq_dict, device=device)
-    rmia_attack = OfflineRobustMIA(target_model=model, target_tokenizer=tokenizer, reference_model=reference_model, reference_tokenizer=reference_tokenizer, a = 1, device=device)
-    noisyneighbour_attack = NoisyNeighbour(model=model, sigma=10**(-1), device=device, batch_size = get_mapped_value(max_length)) # Depending on the max length, we choose the optimal batch size. 512 => 12, 1024 => 6, 2048 => 3
-    tag_tab = TagTab(target_model=model, target_tokenizer=tokenizer, k = 5, device=device, nlp = spacy.load("en_core_web_sm"), min_size=3 if max_length == 43 else 7) 
-    cimia_attack = CIMIA(target_model=model, target_tokenizer=tokenizer, device=device, max_len=max_length, calibration_signal = calibration_signal)
+    rmia_attack = OfflineRobustMIA(
+        target_model=model, 
+        target_tokenizer=tokenizer, 
+        reference_models=[reference_model_1, reference_model_2],       # Correct Plural
+        reference_tokenizers=[reference_tokenizer_1, reference_tokenizer_2], # Correct Plural
+        a_range=np.arange(0, 1.1, 0.25), 
+        gamma=2, 
+        device=device
+    )
+    
+    rmia_attack.precompute_population_statistics(non_members['text'][:num_signals])
+    noisyneighbour_attack = NoisyNeighbour(
+        model=model, 
+        sigma=10**(-1), 
+        device=device, 
+        batch_size = get_mapped_value(max_length)
+    ) # Depending on the max length, we choose the optimal batch size. 512 => 12, 1024 => 6, 2048 => 3
+    
+    tag_tab = TagTab(
+        target_model=model, 
+        target_tokenizer=tokenizer, 
+        k = 5, 
+        device=device, 
+        nlp = spacy.load("en_core_web_sm"), 
+        min_size=3 if max_length == 43 else 7
+    ) 
+    
+    cimia_attack = CIMIA(
+        target_model=model, 
+        target_tokenizer=tokenizer, 
+        device=device, max_len=max_length, 
+        calibration_signal = calibration_signal
+    )
     
     completed_configs = set()
     # if os.path.exists("output_mia/completed_log.txt"):
@@ -134,19 +182,52 @@ def main(pythia_model: str, max_length: int, miaset: str, dataset: str, dataset_
 
     try:
         members = load_from_disk(dataset_path=f"{output_directory}/members")
-        non_members = load_from_disk(dataset_path=f"{output_directory}/non_members")
         
         rng = np.random.default_rng(seed=42) 
 
+        #### OLD RAND NON_MEMBER
+        
         # Negative / Non-Member Prefix
-        rand_idx_non = rng.integers(low=0, high=len(non_members), size=1 if max_length in [43, 512, 1024] else 2) # 7 Shots mentioned in the ConRecall Paper by Wang et al., but we only use 1 shots depending on the scale, because we have only 2048 context window
-        non_members_shots = non_members.select(rand_idx_non)["text"]
-        global_non_member_prefix = safe_pre_encode_shots(text_list=non_members_shots, tokenizer=tokenizer, max_shot_len=min(max_length-1, 1023))
+        # rand_idx_non = rng.integers(low=0, high=len(non_members), size=1 if max_length in [43, 512, 1024] else 2) # 7 Shots mentioned in the ConRecall Paper by Wang et al., but we only use 1 shots depending on the scale, because we have only 2048 context window
+        # non_members_shots = non_members.select(rand_idx_non)["text"]
+        # global_non_member_prefix = safe_pre_encode_shots(text_list=non_members_shots, tokenizer=tokenizer, max_shot_len=min(max_length-1, 1023))
 
         # Member Prefix
         rand_idx_mem = rng.integers(low=0, high=len(members), size=1 if max_length in [43, 512, 1024] else 2) # 7 Shots mentioned in the ConRecall Paper by Wang et al., but we only use 1 or 2 shots depending on the scale, because we have only 2048 context window. Most optimal method int(MODEL_MAX_LENGTH//max_length)-1
         members_shots = members.select(rand_idx_mem)["text"]
         global_member_prefix = safe_pre_encode_shots(text_list=members_shots, tokenizer=tokenizer, max_shot_len=min(max_length-1, 1023))
+        
+        #### NEW TOPPREF for non_member (see EM-MIA paper)
+        
+        # 1. Negative / Non-Member Prefix Candidates
+        
+        prefix_subset = non_members['text'][:min(int(len(non_members['text']) * 0.25), 250)]
+        
+        # 2. Validation Set (The Jury)
+        validation_pool_size = min(int(len(members) * 0.1), 100)
+        rand_idx_mem = rng.integers(low=0, high=len(members), size=validation_pool_size)
+        
+        # Construct Validation Set: [Non-Members, Members]
+        validation_set = prefix_subset + [members['text'][idx] for idx in rand_idx_mem]
+        
+        # prefix_subset are Non-Members -> Label 1
+        # Members -> Label 0
+        validation_labels = [1] * len(prefix_subset) + [0] * validation_pool_size
+        
+        ranked_candidates = topPref(
+            candidate_prefixes=prefix_subset, 
+            validation_texts=validation_set, 
+            validation_labels=validation_labels, 
+            tokenizer=tokenizer, 
+            model=model, 
+            device=device, 
+            num_prefix=1 if max_length in [43, 512, 1024] else 2
+        )
+        
+        non_members_shots = [item[1] for item in ranked_candidates]
+        global_non_member_prefix = safe_pre_encode_shots(text_list=non_members_shots, tokenizer=tokenizer, max_shot_len=min(max_length-1, 1023))
+
+        print(f"Member Prefix: {global_member_prefix}.\nNon-Member Prefix:{global_non_member_prefix}\n with best non-member prefixes (TOP 10): {ranked_candidates[:10]}")
         
         if miaset == "member":
             # config_signature = f"DONE: member_{dataset_name} | Token: {max_length}\n"

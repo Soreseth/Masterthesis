@@ -11,6 +11,8 @@ from collections import defaultdict
 import math
 from nltk.tokenize import sent_tokenize
 from scores import raw_values, CIMIA
+from sklearn.metrics import roc_auc_score
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Set offline mode to prevent internet access
 # os.environ["HF_DATASETS_OFFLINE"] = "1"
@@ -39,6 +41,146 @@ class TensorEncoder(json.JSONEncoder):
             return obj.item()
             
         return super().default(obj)
+
+import torch
+import numpy as np
+from tqdm import tqdm
+from sklearn.metrics import roc_auc_score
+from torch.nn import CrossEntropyLoss
+import gc
+
+def compute_batch_scores(tokenizer, model, device, target_texts, prefix_text=None, batch_size=4):
+    """
+    Computes Log-Likelihoods for a batch of targets against a single prefix.
+    strictly enforces separate truncation for prefix and targets.
+    """
+    scores = []
+    
+    # 1. Prepare Prefix (Once per batch loop)
+    # We tokenize the prefix ONLY ONCE to save CPU time
+    if prefix_text:
+        prefix_tokens = tokenizer(
+            prefix_text, 
+            return_tensors="pt", 
+            truncation=True, 
+            max_length=512, 
+            add_special_tokens=False
+        )
+        prefix_ids = prefix_tokens.input_ids.to(device) # Shape: [1, Seq_Len]
+        prefix_len = prefix_ids.shape[1]
+    else:
+        prefix_ids = None
+        prefix_len = 0
+
+    # 2. Process Targets in Batches
+    for i in range(0, len(target_texts), batch_size):
+        batch_targets = target_texts[i:i + batch_size]
+        
+        # Tokenize Batch of Targets (Strict Max 512 + Padding)
+        target_tokens = tokenizer(
+            batch_targets,
+            return_tensors="pt",
+            padding=True,           # Pad to longest in batch
+            truncation=True,        # Strict truncation
+            max_length=512,         # Strict max length for target
+            add_special_tokens=False
+        ).to(device)
+        
+        target_ids = target_tokens.input_ids
+        target_mask = target_tokens.attention_mask
+        
+        # 3. Concatenate Prefix + Targets
+        if prefix_ids is not None:
+            # Expand prefix to match batch size: [1, L] -> [Batch, L]
+            current_batch_size = target_ids.shape[0]
+            batch_prefix_ids = prefix_ids.expand(current_batch_size, -1)
+            batch_prefix_mask = torch.ones_like(batch_prefix_ids)
+            
+            # Concat: [Prefix, Target]
+            input_ids = torch.cat((batch_prefix_ids, target_ids), dim=1)
+            attention_mask = torch.cat((batch_prefix_mask, target_mask), dim=1)
+        else:
+            input_ids = target_ids
+            attention_mask = target_mask
+
+        # 4. Model Forward Pass
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits
+            
+            # Shift for Causal LM Loss
+            # Logits: predict next token (remove last)
+            shift_logits = logits[..., :-1, :].contiguous()
+            # Labels: are the next tokens (remove first)
+            shift_labels = input_ids[..., 1:].contiguous()
+            
+            # Loss per token
+            loss_fct = CrossEntropyLoss(reduction='none')
+            # Flatten batch for loss calculation
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss.view(shift_labels.size())
+            
+            # Mask Padding (so pads don't count towards score)
+            shift_mask = attention_mask[..., 1:].contiguous()
+            loss = loss * shift_mask
+            
+            # Average Loss per Sequence
+            seq_lens = shift_mask.sum(dim=1)
+            # return negative loss
+            batch_scores = - (loss.sum(dim=1) / torch.clamp(seq_lens, min=1))
+            
+            scores.extend(batch_scores.cpu().numpy())
+            
+        # Cleanup memory
+        del input_ids, attention_mask, logits, loss
+    
+    return np.array(scores)
+
+def topPref(candidate_prefixes, validation_texts, validation_labels, tokenizer, model, device, num_prefix:int, batch_size=8):
+    """ 
+    Fast TopPref using Batched Inference.
+    """
+    ranked_results = []
+
+    print(f"Start search for optimal prefix under {len(candidate_prefixes)} candidates ...")
+    unconditional_scores = compute_batch_scores(
+        tokenizer, model, device, validation_texts, prefix_text=None, batch_size=batch_size
+    )
+
+    # ---------------------------------------------------------
+    # 2. Search Loop
+    # ---------------------------------------------------------
+    print("Testing prefixes...")
+    for prefix in tqdm(candidate_prefixes, desc="Testing Prefixes"):
+        
+        # Compute Conditional Scores (Batched)
+        # Process ALL validation texts against THIS prefix in batches
+        conditional_scores = compute_batch_scores(
+            tokenizer, model, device, validation_texts, prefix_text=prefix, batch_size=batch_size
+        )
+        
+        # Vectorized ReCaLL Calculation
+        recall_scores = conditional_scores / (unconditional_scores + 1e-10)
+        
+        # AUC Calculation
+        try:
+            current_auc = roc_auc_score(validation_labels, recall_scores)
+        except ValueError:
+            current_auc = 0.5 
+        
+        ranked_results.append((current_auc, prefix))
+
+    # Sort
+    ranked_results.sort(key=lambda x: x[0], reverse=True)
+
+    # Output
+    print("-" * 40)
+    if ranked_results:
+        best_score, best_p = ranked_results[0]
+        print(f"WINNER PREFIX: '{best_p[:50]}...'")
+        print(f"PERFECT SCORE: {best_score:.4f}")
+        
+    return ranked_results[:num_prefix]
 
 def safe_pre_encode_shots(text_list, tokenizer, max_shot_len:int):
     """
