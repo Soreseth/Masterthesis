@@ -15,19 +15,56 @@ import re
 import string
 import json
 from wordfreq import word_frequency
+from typing import Any, Optional, List, Dict, Tuple, Sequence, Union
 
 MODEL_MAX_LENGTH = 2048
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-def fix_seed(seed: int = 0):
+def fix_seed(seed: int = 0) -> None:
+    """
+                Set random seeds for reproducibility across torch, numpy and random.
+    
+                Parameters
+                ----------
+                seed : int, optional
+                    Seed value to set for reproducibility (default is 0).
+    
+                Returns
+                -------
+                None
+    
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-def raw_values(sentence: str, model, tokenizer, device) -> dict:
+def raw_values(sentence: str, model: torch.nn.Module, tokenizer: Any, device: torch.device) -> Dict[str, Any]:
     """
-    Used to calculate the cross-entropy and probabilities of tokens for a SINGLE sentence.
-    No batch processing involved.
+                Compute loss, per-token probabilities and related tensors for a single sentence.
+    
+                Parameters
+                ----------
+                sentence : str
+                    Input sentence to evaluate.
+                model : torch.nn.Module
+                    Language model used to compute logits and loss (expects HF-like forward API).
+                tokenizer : Any
+                    Tokenizer providing encoding/decoding methods (HuggingFace tokenizer-like).
+                device : torch.device
+                    Device where tensors and model reside (e.g., torch.device('cuda:0') or 'cpu').
+    
+                Returns
+                -------
+                dict
+                    Dictionary with keys:
+                    - 'loss' (torch.Tensor): average cross-entropy loss for the sentence.
+                    - 'token_probs' (torch.Tensor): per-token probabilities for the true labels.
+                    - 'token_log_probs' (torch.Tensor): per-token log-probabilities for the true labels.
+                    - 'logits' (torch.Tensor): model logits for the input (batched).
+                    - 'input_ids' (torch.Tensor): target token ids aligned with logits.
+                    - 'full_token_probs' (torch.Tensor): full vocabulary probabilities per position.
+                    - 'full_log_probs' (torch.Tensor): full vocabulary log-probabilities per position.
+    
     """
     encodings = tokenizer(
         sentence, 
@@ -74,24 +111,93 @@ def raw_values(sentence: str, model, tokenizer, device) -> dict:
         "full_log_probs": log_probs
     }
 
-def perplexity(loss: float):
+def perplexity(loss: float) -> float:
+    """
+                Compute perplexity from a cross-entropy loss.
+    
+                Parameters
+                ----------
+                loss : float
+                    Average cross-entropy loss.
+    
+                Returns
+                -------
+                float
+                    Exponential of the loss (perplexity).
+    
+    """
     return math.exp(loss)
 
-def zlib_entropy(sentence: str):
+def zlib_entropy(sentence: str) -> int:
+    """
+                Approximate entropy of a string by measuring zlib-compressed length.
+    
+                Parameters
+                ----------
+                sentence : str
+                    Input text.
+    
+                Returns
+                -------
+                int
+                    Length in bytes of zlib.compress(sentence.encode('utf-8')).
+    
+    """
     return len(zlib.compress(bytes(sentence, 'utf-8')))
 
 class Baseline:
-    def __init__(self, logits: torch.Tensor , input_ids: torch.Tensor, token_log_probs: torch.Tensor):
+    def __init__(self, logits: torch.Tensor, input_ids: torch.Tensor, token_log_probs: torch.Tensor) -> None:
+        """
+                    Store tensors required by baseline scoring helpers.
+        
+                    Parameters
+                    ----------
+                    logits : torch.Tensor
+                        Model logits (usually shape [1, seq_len, vocab]).
+                    input_ids : torch.Tensor
+                        Target token ids aligned with logits.
+                    token_log_probs : torch.Tensor
+                        Log-probabilities of the target tokens (per position).
+        
+        """
         self.logits = logits
         self.token_log_probs = token_log_probs
         self.input_ids = input_ids
         
-    def min_k(self, ratio:float = 0.05) -> torch.Tensor:
+    def min_k(self, ratio: float = 0.05) -> float:
+        """
+                    Compute mean of the lowest-k token log-probabilities.
+        
+                    Parameters
+                    ----------
+                    ratio : float, optional
+                        Fraction of tokens to include in the "k" set (default 0.05).
+        
+                    Returns
+                    -------
+                    float
+                        Mean of the selected lowest log-probabilities.
+        
+        """
         k_length = max(1, int(len(self.token_log_probs)*ratio))
         topk, _ = torch.topk(self.token_log_probs, k_length, largest=False)
         return nanmean(topk).item()
 
-    def min_k_plus_plus(self, ratio:float = 0.05) -> torch.Tensor:
+    def min_k_plus_plus(self, ratio: float = 0.05) -> float:
+        """
+                    Variation of min_k that normalizes by local mean and variance (z-score like).
+        
+                    Parameters
+                    ----------
+                    ratio : float, optional
+                        Fraction of tokens to include in the "k" set (default 0.05).
+        
+                    Returns
+                    -------
+                    float
+                        Mean of the selected normalized scores.
+        
+        """
         # logits: [1, seq, vocab] -> [seq, vocab]
         probs = F.softmax(self.logits[0], dim=-1)
         log_probs = F.log_softmax(self.logits[0], dim=-1)
@@ -104,7 +210,16 @@ class Baseline:
         topk, _ = torch.topk(mink_plus, k_length, largest=False)
         return nanmean(topk).item()
 
-    def ranks(self) -> torch.Tensor:
+    def ranks(self) -> float:
+        """
+                    Compute the average rank of the correct tokens in the model logits distribution.
+        
+                    Returns
+                    -------
+                    float
+                        Average token rank (1 means the token is the top prediction).
+        
+        """
         logits = self.logits
         labels = self.input_ids if self.input_ids.dim() == 2 else self.input_ids.squeeze(0)
         
@@ -114,16 +229,41 @@ class Baseline:
         return torch.nanmean(ranks).item()
 
 class RelativeLikelihood:
-    def __init__(self, base_model, base_tokenizer, device):
+    def __init__(self, base_model: Any, base_tokenizer: Any, device: torch.device) -> None:
+        """
+                    Helper for computing conditional likelihoods using a base language model.
+        
+                    Parameters
+                    ----------
+                    base_model : Any
+                        Language model used for loss computations.
+                    base_tokenizer : Any
+                        Tokenizer corresponding to the base_model.
+                    device : torch.device
+                        Device to run computations on.
+        
+        """
         self.base_model = base_model
         self.base_tokenizer = base_tokenizer
         self.device = device
         self.max_length = getattr(self.base_model.config, "max_position_embeddings", 2048)
 
-    def _get_smart_chunks(self, input_ids: torch.Tensor, num_chunks: int):
+    def _get_smart_chunks(self, input_ids: torch.Tensor, num_chunks: int) -> List[torch.Tensor]:
         """
-        Splits input_ids into 'num_chunks' segments, ensuring each segment 
-        ends on a sentence boundary (., ?, !, or newline) if possible.
+                    Split input_ids into `num_chunks` trying to preserve sentence boundaries.
+        
+                    Parameters
+                    ----------
+                    input_ids : torch.Tensor
+                        Tensor of shape [1, seq_len] containing token ids.
+                    num_chunks : int
+                        Desired number of chunks.
+        
+                    Returns
+                    -------
+                    list of torch.Tensor
+                        List of chunk tensors (each shape [1, chunk_len]).
+        
         """
         total_len = input_ids.shape[1]
         max_chunk_size = math.ceil(total_len / num_chunks)
@@ -183,9 +323,23 @@ class RelativeLikelihood:
         return chunks
 
     def _get_single_loss(self, prefix_tensor: torch.Tensor, target: str) -> float:
-        """ 
-        Calculates loss for a single prefix+target combination.
-        Uses smart sentence splitting for multi-chunk targets.
+        """
+                    Compute the (average) loss for a single prefix + target combination.
+        
+                    The target text may be split into multiple smart chunks and averaged.
+        
+                    Parameters
+                    ----------
+                    prefix_tensor : torch.Tensor
+                        Prefix tensor (can be batched) used as context before the target.
+                    target : str
+                        Target text to evaluate.
+        
+                    Returns
+                    -------
+                    float
+                        Average loss across target chunks.
+        
         """
         # Encode target
         target_enc = self.base_tokenizer(
@@ -242,8 +396,25 @@ class RelativeLikelihood:
         # Return the AVERAGE loss across chunks
         return sum(losses) / len(losses)
 
-    def calc_recall(self, text: str, base_loss: float, negative_prefix_list: list) -> float:
+    def calc_recall(self, text: str, base_loss: float, negative_prefix_list: List[torch.Tensor]) -> float:
+        """
+                    Compute a recall-like metric comparing conditional loss with a set of negative prefixes.
         
+                    Parameters
+                    ----------
+                    text : str
+                        Target text.
+                    base_loss : float
+                        Loss of the target under the base model.
+                    negative_prefix_list : list of torch.Tensor
+                        List of negative prefix tensors to compute conditional loss.
+        
+                    Returns
+                    -------
+                    float
+                        Ratio cond_loss / base_loss (or 0.0 when base_loss == 0).
+        
+        """
         if negative_prefix_list:
             # Concatenate and ensure it's on the correct device
             prefix_tensor = torch.cat(negative_prefix_list, dim=1).to(self.device)
@@ -257,7 +428,27 @@ class RelativeLikelihood:
             return 0.0
         return cond_loss / base_loss
 
-    def calc_conrecall(self, text: str, base_loss: float, member_prefix_list: list, non_member_prefix_list: list) -> dict:
+    def calc_conrecall(self, text: str, base_loss: float, member_prefix_list: List[torch.Tensor], non_member_prefix_list: List[torch.Tensor]) -> Dict[str, float]:
+        """
+                    Compute conrecall metrics across several gamma thresholds comparing member and non-member prefixes.
+        
+                    Parameters
+                    ----------
+                    text : str
+                        Target text.
+                    base_loss : float
+                        Loss of the target under the base model.
+                    member_prefix_list : list of torch.Tensor
+                        List of member prefix tensors.
+                    non_member_prefix_list : list of torch.Tensor
+                        List of non-member prefix tensors.
+        
+                    Returns
+                    -------
+                    dict
+                        Dictionary mapping 'conrecall_gamma_*' to float scores.
+        
+        """
         # Member shots
         if member_prefix_list:
             mem_tensor = torch.cat(member_prefix_list, dim=1).to(self.device)
@@ -286,7 +477,26 @@ class RelativeLikelihood:
         return scores
 
 class TagTab:
-    def __init__(self, target_model, target_tokenizer, k:int, nlp, device, min_size:int = 7):
+    def __init__(self, target_model: Any, target_tokenizer: Any, k: int, nlp: Any, device: torch.device, min_size: int = 7) -> None:
+        """
+                    Keyword/NER based scoring helper (TAG-TAB style).
+        
+                    Parameters
+                    ----------
+                    target_model : Any
+                        Model used to compute per-token probabilities.
+                    target_tokenizer : Any
+                        Tokenizer corresponding to the model.
+                    k : int
+                        Number of low-entropy words to select per sentence.
+                    nlp : Any
+                        NLP pipeline (spaCy-like) used for sentence splitting and NER.
+                    device : torch.device
+                        Device used for model inference.
+                    min_size : int, optional
+                        Minimum token count for a sentence to be considered (default 7).
+        
+        """
         self.target_model = target_model
         self.target_tokenizer = target_tokenizer
         self.k = k
@@ -296,11 +506,39 @@ class TagTab:
         self.punc_table = str.maketrans("", "", string.punctuation)
     
     def _normalize_token(self, w: str) -> str:
+        """
+                    Normalize a token by lowercasing, removing punctuation and whitespace.
+        
+                    Parameters
+                    ----------
+                    w : str
+                        Input token text.
+        
+                    Returns
+                    -------
+                    str
+                        Normalized token.
+        
+        """
         w = w.lower().translate(self.punc_table)
         w = re.sub(r"\s+", "", w)
         return w
     
-    def get_tab_keywords(self, text:str):
+    def get_tab_keywords(self, text: str) -> List[Tuple[np.ndarray, List[str]]]:
+        """
+                    Extract candidate keyword index sets and corresponding words per sentence.
+        
+                    Parameters
+                    ----------
+                    text : str
+                        Input document text.
+        
+                    Returns
+                    -------
+                    list of (np.ndarray, list)
+                        Each element is a tuple (indices_array, selected_words).
+        
+        """
         docs = self.nlp(text)
         result = []
         for sent_span in docs.sents:
@@ -342,7 +580,23 @@ class TagTab:
 
         return result
     
-    def get_tab_score(self, text: str, keywords: list[str]):
+    def get_tab_score(self, text: str, keywords: List[Tuple[np.ndarray, List[str]]]) -> float:
+        """
+                    Compute an average log-probability score for spans corresponding to the provided keywords.
+        
+                    Parameters
+                    ----------
+                    text : str
+                        Input text.
+                    keywords : list of (np.ndarray, list)
+                        Output from get_tab_keywords indicating keyword spans and words.
+        
+                    Returns
+                    -------
+                    float
+                        Mean log-probability across matched keyword spans (or 0.0 if none found).
+        
+        """
         inputs = self.target_tokenizer(text, padding = True, truncation = True, max_length = MODEL_MAX_LENGTH, return_tensors='pt').to(self.device)
         input_ids = inputs.input_ids
         
@@ -394,21 +648,68 @@ class TagTab:
             
         return np.mean(relevant_log_probs, dtype=np.float32)
     
-    def predict(self, text: str):
+    def predict(self, text: str) -> float:
+        """
+                    Convenience wrapper that extracts keywords and returns the TAB score for the text.
+        
+                    Parameters
+                    ----------
+                    text : str
+                        Input text.
+        
+                    Returns
+                    -------
+                    float
+                        TAB score (0.0 when no keywords are found).
+        
+        """
         keyword_batches = self.get_tab_keywords(text)
         if not keyword_batches:
             return 0.0
         return self.get_tab_score(text, keyword_batches)
 
 class NoisyNeighbour:
-    def __init__(self, model, sigma: float, device, batch_size: int = 4):
+    def __init__(self, model: Any, sigma: float, device: torch.device, batch_size: int = 4) -> None:
+        """
+                    Neighbor-based attack that adds Gaussian noise in embedding space and measures loss change.
+        
+                    Parameters
+                    ----------
+                    model : Any
+                        Target model supporting inputs_embeds in forward.
+                    sigma : float
+                        Standard deviation of Gaussian noise to add to embeddings.
+                    device : torch.device
+                        Device used for computation.
+                    batch_size : int, optional
+                        Number of noisy samples to compute per batch (default 4).
+        
+        """
         self.model = model
         self.sigma = sigma
         self.batch_size = batch_size
         self.device = device
         self.dtype = model.dtype 
 
-    def predict(self, input_ids: torch.Tensor, base_loss: float = None, num_of_neighbour: int = 48) -> float:
+    def predict(self, input_ids: torch.Tensor, base_loss: Optional[float] = None, num_of_neighbour: int = 48) -> Optional[float]:
+        """
+                    Compute the difference between original loss and average noisy-neighbour loss.
+        
+                    Parameters
+                    ----------
+                    input_ids : torch.Tensor
+                        Token ids for the input sequence.
+                    base_loss : float or None, optional
+                        Precomputed loss for the original input. If None, it will be computed.
+                    num_of_neighbour : int, optional
+                        Total number of noisy neighbors to generate (should be divisible by batch_size).
+        
+                    Returns
+                    -------
+                    float or None
+                        Original loss minus average neighbour loss (or None on input error).
+        
+        """
         if num_of_neighbour % self.batch_size != 0:
             print("ERROR: Number of Neighbours is not divisible by batch size")
             return None
@@ -449,7 +750,28 @@ class NoisyNeighbour:
         return original_loss - avg_neighbor_loss
 
 class OfflineRobustMIA:
-    def __init__(self, target_model, target_tokenizer, reference_models: list, reference_tokenizers: list, a_range: np.ndarray, gamma: float, device):
+    def __init__(self, target_model: Any, target_tokenizer: Any, reference_models: List[Any], reference_tokenizers: List[Any], a_range: np.ndarray, gamma: float, device: torch.device) -> None:
+        """
+                    Initialize the offline robust MIA scorer with reference models and parameters.
+        
+                    Parameters
+                    ----------
+                    target_model : Any
+                        Model under test.
+                    target_tokenizer : Any
+                        Tokenizer for the target model.
+                    reference_models : list
+                        List of reference models used to approximate background distribution.
+                    reference_tokenizers : list
+                        Corresponding tokenizers for the reference models.
+                    a_range : np.ndarray
+                        Array of 'a' parameter values to evaluate.
+                    gamma : float
+                        Threshold parameter for the LR test.
+                    device : torch.device
+                        Device for running computations.
+        
+        """
         self.target_model = target_model
         self.target_tokenizer = target_tokenizer
         self.reference_models = reference_models
@@ -459,13 +781,45 @@ class OfflineRobustMIA:
         self.device = device
         self.population_ratios = None 
 
-    def _get_prob(self, model, tokenizer, text):
+    def _get_prob(self, model: Any, tokenizer: Any, text: str) -> float:
+        """
+                    Compute model probability proxy exp(-loss) for a single text using a given model/tokenizer.
+        
+                    Parameters
+                    ----------
+                    model : Any
+                        Model to evaluate.
+                    tokenizer : Any
+                        Tokenizer for the model.
+                    text : str
+                        Input text.
+        
+                    Returns
+                    -------
+                    float
+                        exp(-loss) probability proxy.
+        
+        """
         inputs = tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors='pt').to(self.device)
         with torch.no_grad():
             loss = model(**inputs, labels=inputs.input_ids).loss.item()
         return np.exp(-loss)
 
-    def compute_ratios(self, text):
+    def compute_ratios(self, text: str) -> np.ndarray:
+        """
+                    Compute vector of ratios required by the robust MIA decision rule for a text.
+        
+                    Parameters
+                    ----------
+                    text : str
+                        Input text.
+        
+                    Returns
+                    -------
+                    np.ndarray
+                        Array of ratios (one per a value).
+        
+        """
         # 1. Pr(x | theta_target)
         pr_target = self._get_prob(self.target_model, self.target_tokenizer, text)
         
@@ -483,9 +837,19 @@ class OfflineRobustMIA:
         
         return pr_target / pr_x_approx
 
-    def precompute_population_statistics(self, population_samples: list[str]):
+    def precompute_population_statistics(self, population_samples: List[str]) -> None:
         """
-        Run this ONCE. Computes ratios for all z samples.
+                    Precompute ratio statistics for a population of background samples (run once).
+        
+                    Parameters
+                    ----------
+                    population_samples : list of str
+                        Background samples used to form the null distribution.
+        
+                    Returns
+                    -------
+                    None
+        
         """
         print(f"Pre-computing statistics for {len(population_samples)} population samples...")
         all_ratios = []
@@ -498,9 +862,20 @@ class OfflineRobustMIA:
         self.population_ratios = np.stack(all_ratios)
         print("Pre-computation complete.")
 
-    def predict(self, target_text: str):
+    def predict(self, target_text: str) -> Dict[float, float]:
         """
-        Fast prediction using pre-computed z ratios.
+                    Perform a fast prediction using precomputed population statistics.
+        
+                    Parameters
+                    ----------
+                    target_text : str
+                        Text whose membership likelihood will be evaluated.
+        
+                    Returns
+                    -------
+                    dict
+                        Mapping from a value (float) to a score (float) between 0 and 1.
+        
         """
         if self.population_ratios is None:
             raise ValueError("You must call precompute_population_statistics first!")
@@ -531,7 +906,22 @@ class OfflineRobustMIA:
         return {a: score for a, score in zip(self.a_vals, scores)}
     
 class MaxRenyi:
-    def __init__(self, token_probs: torch.Tensor, full_log_probs: torch.Tensor, full_token_probs: torch.Tensor, epsilon: float = 1e-10):
+    def __init__(self, token_probs: torch.Tensor, full_log_probs: torch.Tensor, full_token_probs: torch.Tensor, epsilon: float = 1e-10) -> None:
+        """
+                    Compute a variety of entropy and Rényi-based metrics from token distributions.
+        
+                    Parameters
+                    ----------
+                    token_probs : torch.Tensor
+                        Probabilities of the correct tokens (p_y).
+                    full_log_probs : torch.Tensor
+                        Full vocabulary log probabilities per position.
+                    full_token_probs : torch.Tensor
+                        Full vocabulary probabilities per position.
+                    epsilon : float, optional
+                        Numerical floor to avoid log/zero issues.
+        
+        """
         self.token_probs = token_probs
         self.full_log_probs = full_log_probs
         self.full_token_probs = full_token_probs
@@ -543,7 +933,16 @@ class MaxRenyi:
         full_log_probs: Full vocabulary log distribution.
     """
     
-    def predict(self):
+    def predict(self) -> Dict[str, float]:
+        """
+                    Compute various entropy-based summaries and top-k ratio metrics.
+        
+                    Returns
+                    -------
+                    dict
+                        Dictionary of aggregated metrics (means and top-ratio statistics).
+        
+        """
         # SAFETY CHECK FOR EMPTY TENSORS
         if self.token_probs.numel() == 0:
             # Return a dict with zeros for all potential keys to avoid KeyError downstream
@@ -636,13 +1035,39 @@ class MaxRenyi:
         return results
     
 class DCPDD:
-    def __init__(self, freq_dict, device):
+    def __init__(self, freq_dict: np.ndarray, device: torch.device) -> None:
+        """
+                    Density-based frequency prior scorer initializer.
+        
+                    Parameters
+                    ----------
+                    freq_dict : np.ndarray
+                        Frequency table (index -> frequency) used for scoring.
+                    device : torch.device
+                        Device where tensors will be placed.
+        
+        """
         self.a = 1e-10
         self.device = device
         self.freq_tensor = torch.from_numpy(freq_dict).to(self.device)
 
-    def predict(self, token_probs:torch.Tensor, input_ids:torch.Tensor) -> float:
+    def predict(self, token_probs: torch.Tensor, input_ids: torch.Tensor) -> float:
+        """
+                    Score input by combining token probabilities with frequency priors.
         
+                    Parameters
+                    ----------
+                    token_probs : torch.Tensor
+                        Per-token probabilities for the true labels.
+                    input_ids : torch.Tensor
+                        Token ids aligned with token_probs.
+        
+                    Returns
+                    -------
+                    float
+                        Negative mean cross-entropy-like score (higher indicates more likely membership).
+        
+        """
         # Grab unique indexes. We use np.unique because they can return index.
         ids_np = input_ids.detach().cpu().numpy() 
         _, unique_indices_np = np.unique(ids_np, return_index=True)
@@ -663,7 +1088,24 @@ class DCPDD:
         return -float(nanmean(ce))
 
 class CIMIA:
-    def __init__(self, target_model, target_tokenizer, device, max_len:int, calibration_signal):
+    def __init__(self, target_model: Any, target_tokenizer: Any, device: torch.device, max_len: int, calibration_signal: Dict[str, List[float]]) -> None:
+        """
+                    Initialize combined signals based membership inference (CIMIA) helper.
+        
+                    Parameters
+                    ----------
+                    target_model : Any
+                        Model used to compute losses.
+                    target_tokenizer : Any
+                        Tokenizer for the target model.
+                    device : torch.device
+                        Device used for computation.
+                    max_len : int
+                        Maximum length used for truncation and signal calculations.
+                    calibration_signal : dict
+                        Precomputed calibration signal distributions used for p-value calculation.
+        
+        """
         self.target_model = target_model
         self.target_tokenizer = target_tokenizer
         self.device = device
@@ -672,7 +1114,23 @@ class CIMIA:
         self.m = math.ceil(np.log10(self.max_len))
         self.calibration_signal = calibration_signal
         
-    def diversity_calibration(self, input_ids, token_log_probs):
+    def diversity_calibration(self, input_ids: torch.Tensor, token_log_probs: torch.Tensor) -> float:
+        """
+                    Compute a diversity-calibrated loss: average loss divided by token diversity in prefix.
+        
+                    Parameters
+                    ----------
+                    input_ids : torch.Tensor
+                        Input token ids.
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities.
+        
+                    Returns
+                    -------
+                    float
+                        Diversity-calibrated loss (or 0.0 if input is empty).
+        
+        """
         cut_off = input_ids[:self.T]
         if cut_off.numel() == 0: 
             return 0.0
@@ -681,7 +1139,21 @@ class CIMIA:
         loss = (-token_log_probs[:self.T]).mean().item()
         return loss / d_X
     
-    def cut_off_loss(self, input_ids):
+    def cut_off_loss(self, input_ids: torch.Tensor) -> float:
+        """
+                    Compute loss on the truncated prefix of the input (up to T tokens).
+        
+                    Parameters
+                    ----------
+                    input_ids : torch.Tensor
+                        Input token ids.
+        
+                    Returns
+                    -------
+                    float
+                        Loss value computed on the cutoff prefix.
+        
+        """
         cut_off = input_ids[:self.T]
         
         if cut_off.dim() == 1:
@@ -691,7 +1163,23 @@ class CIMIA:
             loss = self.target_model(cut_off, labels=cut_off).loss.item()
         return loss
     
-    def slope_loss(self, input_ids, token_log_probs):
+    def slope_loss(self, input_ids: torch.Tensor, token_log_probs: torch.Tensor) -> float:
+        """
+                    Compute slope-based signal comparing token losses across positions.
+        
+                    Parameters
+                    ----------
+                    input_ids : torch.Tensor
+                        Input token ids.
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities.
+        
+                    Returns
+                    -------
+                    float
+                        Slope-derived signal (or 0.0 if undefined).
+        
+        """
         cut_off = input_ids[:self.T]
         cut_off_batch = cut_off.unsqueeze(0) if cut_off.dim() == 1 else cut_off
         
@@ -707,8 +1195,23 @@ class CIMIA:
         
         return nominator/denominator
     
-    def robust_low_loss_counting(self, thresholds: list[float], token_log_probs):
+    def robust_low_loss_counting(self, thresholds: List[float], token_log_probs: torch.Tensor) -> List[float]:
+        """
+                    Count fraction of positions with token losses below given thresholds.
         
+                    Parameters
+                    ----------
+                    thresholds : list of float
+                        Thresholds to evaluate.
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities.
+        
+                    Returns
+                    -------
+                    list of float
+                        Fractions for each threshold plus two aggregate measures.
+        
+        """
         if token_log_probs[:self.T].numel() == 0:
             return [0.0] * (len(thresholds) + 2)
         
@@ -730,8 +1233,23 @@ class CIMIA:
 
         return f_cb + [f_cbm, f_cbpm]
     
-    def repetition_amplification(self, input_ids, loss):
+    def repetition_amplification(self, input_ids: torch.Tensor, loss: float) -> float:
+        """
+                    Measure how much the loss decreases when repeating the input sequence.
         
+                    Parameters
+                    ----------
+                    input_ids : torch.Tensor
+                        Input token ids.
+                    loss : float
+                        Baseline loss for the input.
+        
+                    Returns
+                    -------
+                    float
+                        Difference between original and repeated-segment loss.
+        
+        """
         if input_ids.numel() == 0: 
             return 0.0
         safe_len = int(MODEL_MAX_LENGTH / 2)
@@ -767,7 +1285,23 @@ class CIMIA:
             
         return current_loss - rep_loss
     
-    def lempel_ziv_complexity(self, bins:int, token_log_probs):
+    def lempel_ziv_complexity(self, bins: int, token_log_probs: torch.Tensor) -> float:
+        """
+                    Estimate Lempel-Ziv complexity on discretized token-loss sequence.
+        
+                    Parameters
+                    ----------
+                    bins : int
+                        Number of bins for discretization.
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities.
+        
+                    Returns
+                    -------
+                    float
+                        Normalized LZ complexity measure.
+        
+        """
         x = -token_log_probs[:self.T].detach().cpu().numpy()
         x = np.asarray(x)
         if len(x) == 0: 
@@ -794,7 +1328,25 @@ class CIMIA:
                 inc = 1
         return len(sub_strings) / n
         
-    def approximate_entropy(self, m:int, r:float, token_log_probs):
+    def approximate_entropy(self, m: int, r: float, token_log_probs: torch.Tensor) -> float:
+        """
+                    Approximate entropy (ApEn) estimator for the token-loss sequence.
+        
+                    Parameters
+                    ----------
+                    m : int
+                        Embedding dimension.
+                    r : float
+                        Tolerance multiplier (scaled by std of sequence).
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities.
+        
+                    Returns
+                    -------
+                    float
+                        Approximate entropy value.
+        
+        """
         x = -token_log_probs[:self.T].detach().cpu().numpy()
         if not isinstance(x, (np.ndarray, pd.Series)):
             x = np.asarray(x)
@@ -805,6 +1357,10 @@ class CIMIA:
         if N <= m + 1: return 0
 
         def _phi(m):
+            """
+                        Internal helper used by approximate_entropy. No external typing enforced.
+            
+            """
             x_re = np.array([x[i : i + m] for i in range(N - m + 1)])
             C = np.sum(
                 np.max(np.abs(x_re[:, np.newaxis] - x_re[np.newaxis, :]), axis=2) <= r,
@@ -814,7 +1370,25 @@ class CIMIA:
 
         return np.abs(_phi(m) - _phi(m + 1))
 
-    def calculate_p_values(self, value, calibration_values, is_higher_better:bool = False):
+    def calculate_p_values(self, value: float, calibration_values: Sequence[float], is_higher_better: bool = False) -> float:
+        """
+                    Compute empirical p-value of `value` relative to calibration distribution.
+        
+                    Parameters
+                    ----------
+                    value : float
+                        Observed value.
+                    calibration_values : sequence of float
+                        Calibration (background) values to compare against.
+                    is_higher_better : bool, optional
+                        If True, higher values are better (invert sign) for ranking purposes.
+        
+                    Returns
+                    -------
+                    float
+                        Empirical p-value in (0,1], returned as python float.
+        
+        """
         cal_vals = np.array(calibration_values, dtype=np.float32)
         if len(cal_vals) == 0: 
             return 0.5 
@@ -826,8 +1400,29 @@ class CIMIA:
         p_val = (np.sum(cal_vals <= value) + 1) / (len(cal_vals) + 1)
         return p_val.item()
     
-    def predict(self, loss, input_ids, token_log_probs, combining_method: str = "edgington", raw_signals: bool = False):
+    def predict(self, loss: float, input_ids: torch.Tensor, token_log_probs: torch.Tensor, combining_method: str = "edgington", raw_signals: bool = False) -> Union[float, Dict[str, float]]:
+        """
+                    Compute combined CIMIA score (or return raw signals if requested).
         
+                    Parameters
+                    ----------
+                    loss : float
+                        Baseline loss for the input.
+                    input_ids : torch.Tensor
+                        Input token ids.
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities.
+                    combining_method : str, optional
+                        Method to combine p-values into a single score (default 'edgington').
+                    raw_signals : bool, optional
+                        If True, return the raw signal dictionary instead of a aggregated score.
+        
+                    Returns
+                    -------
+                    float or dict
+                        Aggregated score (float) or raw signal dictionary.
+        
+        """
         self.T = max(1, min(input_ids.numel(), int(self.max_len / 2)))
         
         # Calculate each signal
@@ -877,7 +1472,28 @@ class CIMIA:
         return score.item()
     
 class ACMIA:
-    def __init__(self, device, logits: torch.Tensor, probs: torch.Tensor, log_probs: torch.Tensor, token_log_probs: torch.Tensor, input_ids: torch.Tensor, temperatures: np.ndarray):
+    def __init__(self, device: torch.device, logits: torch.Tensor, probs: torch.Tensor, log_probs: torch.Tensor, token_log_probs: torch.Tensor, input_ids: torch.Tensor, temperatures: np.ndarray) -> None:
+        """
+                    Auto-calibration and temperature scaling helper initializer.
+        
+                    Parameters
+                    ----------
+                    device : torch.device
+                        Device used for computations.
+                    logits : torch.Tensor
+                        Model logits (shape [1, seq_len, vocab]).
+                    probs : torch.Tensor
+                        Softmax probabilities for logits.
+                    log_probs : torch.Tensor
+                        Log-softmax for logits.
+                    token_log_probs : torch.Tensor
+                        Per-token log-probabilities for the true labels.
+                    input_ids : torch.Tensor
+                        Input ids tensor used for gathering target log-probs.
+                    temperatures : np.ndarray
+                        Temperature values to use for scaling experiments.
+        
+        """
         self.device = device
         self.logits = logits
         self.probs = probs
@@ -886,8 +1502,16 @@ class ACMIA:
         self.input_ids = input_ids
         self.temperatures = temperatures
         
-    def get_fos_mask(self):
-        """Erstellt eine Maske für First Occurrence of Tokens (FOS)"""
+    def get_fos_mask(self) -> torch.Tensor:
+        """
+                    Create a boolean mask marking the first occurrence of each token in the sequence (FOS).
+        
+                    Returns
+                    -------
+                    torch.Tensor
+                        Boolean mask (1D) with True at first occurrences.
+        
+        """
         # FIX: Squeeze input_ids to 1D [seq_len] to calculate indices
         input_ids_flat = self.input_ids.squeeze().cpu().numpy()
         
@@ -900,7 +1524,16 @@ class ACMIA:
         # FIX: Return 1D mask (shape: [seq_len]). Do not reshape to (1, -1).
         return torch.from_numpy(mask).to(self.device)
 
-    def temperature_scaling(self):
+    def temperature_scaling(self) -> Tuple[list, list, list]:
+        """
+                    Apply temperature scaling to the full vocabulary log-probabilities and extract statistics.
+        
+                    Returns
+                    -------
+                    tuple of lists
+                        (log_probs_by_temperature, mu_by_temperature, sigma_by_temperature)
+        
+        """
         log_probs_temprature = []
         mu_temprature = []
         sigma_temprature = []
@@ -944,7 +1577,16 @@ class ACMIA:
         
         return log_probs_temprature, mu_temprature, sigma_temprature
     
-    def predict(self):
+    def predict(self) -> Dict[str, list]:
+        """
+                    Compute AC/DerivAC/NormAC scores across temperatures using first-occurrence mask.
+        
+                    Returns
+                    -------
+                    dict
+                        Mapping score-name -> list of aggregated values per temperature.
+        
+        """
         log_probs_temprature, mu_temprature, sigma_temprature = self.temperature_scaling()
         # temps_tsp becomes shape [num_temperatures, seq_len]
         temps_tsp = np.array(log_probs_temprature)
@@ -990,9 +1632,44 @@ class ACMIA:
                 
         return scores
 
-def inference(text: str, model, tokenizer, negative_prefix:torch.Tensor, member_prefix:torch.Tensor, non_member_prefix:torch.Tensor, device, rel_attacks: RelativeLikelihood, dcpdd: DCPDD, offline_rmia: OfflineRobustMIA, noisy_attack: NoisyNeighbour, tagtab_attack: TagTab, cimia_attack: CIMIA) -> dict:
+def inference(text: str, model: torch.nn.Module, tokenizer: Any, negative_prefix: List[torch.Tensor], member_prefix: List[torch.Tensor], non_member_prefix: List[torch.Tensor], device: torch.device, rel_attacks: RelativeLikelihood, dcpdd: DCPDD, offline_rmia: OfflineRobustMIA, noisy_attack: NoisyNeighbour, tagtab_attack: TagTab, cimia_attack: CIMIA) -> Optional[Dict[str, Any]]:
     """
-    Performs inference for a single text string.
+                Run the full set of inference-based membership and uncertainty metrics for a single text.
+    
+                Parameters
+                ----------
+                text : str
+                    Input text to evaluate.
+                model : torch.nn.Module
+                    Target model used for core loss/probability computations.
+                tokenizer : Any
+                    Tokenizer for the target model.
+                negative_prefix : list of torch.Tensor
+                    Negative prefix tensors used for recall-like metrics.
+                member_prefix : list of torch.Tensor
+                    Prefixes corresponding to member class shots.
+                non_member_prefix : list of torch.Tensor
+                    Prefixes corresponding to non-member class shots.
+                device : torch.device
+                    Device where models and tensors live.
+                rel_attacks : RelativeLikelihood
+                    Relative-likelihood helper instance.
+                dcpdd : DCPDD
+                    DCPDD scorer instance.
+                offline_rmia : OfflineRobustMIA
+                    Offline robust MIA instance.
+                noisy_attack : NoisyNeighbour
+                    Noisy neighbour attack instance.
+                tagtab_attack : TagTab
+                    TagTab scoring instance.
+                cimia_attack : CIMIA
+                    CIMIA aggregator instance.
+    
+                Returns
+                -------
+                dict or None
+                    Dictionary of metric names to values, or None if the input produced no tokens.
+    
     """
     
     data = raw_values(text, model, tokenizer, device)
