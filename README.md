@@ -29,19 +29,21 @@ These findings suggest that the membership signal in modern LLM is concentrated 
 ## Setup
 
 ```bash
-git clone <repo>
 cd Masterthesis
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+```
 
 # Download Spacy NER model
+```bash
 python -m spacy download en_core_web_sm
+```
 
-# Required env vars (or use the defaults shown)
+# The script need to have access to various dir locations to save and load datasets/models. If the hf_dir is not in the same folder as this dir, then set a custom path. 
+```
 export MIA_ROOT=$PWD/mia_scores          
 export HF_HOME=$PWD/hf_cache             
 export DATASET_DIR=$HF_HOME/datasets/parameterlab
-# Optional overrides
 export PCS_DIR=$MIA_ROOT/results/pcs     
 export DEFENDED_MODELS_ROOT=$PWD/defended_models
 ```
@@ -52,10 +54,9 @@ export DEFENDED_MODELS_ROOT=$PWD/defended_models
 
 ```bash
 python -m src.utils.download
-# fetches Pythia-2.8b/6.9b + reference checkpoints (70m/160m/410m/1b)
-# downloads the 8 Pile MIA splits (parameterlab) and chunks them at ctx 43/512/1024/2048
-# add --mimir for the MIMIR n-gram-overlap splits
 ```
+Fetches Pythia-2.8b/6.9b + reference checkpoints (70m/160m/410m/1b) at step1 and final. 
+Then download the 8 Pile MIA splits (parameterlab) and chunk them at ctx 43/512/1024/2048.
 
 ### 2. Per-paragraph MIA scores
 
