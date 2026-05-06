@@ -1,73 +1,132 @@
 # Enhanced Membership Inference Attacks through Statistical Score Aggregation in Large Language Models
 
-This repository contains code and experiments for my masterthesis with the title "Enhanced Membership Inference Attacks through Statistical Score Aggregation in Large Language Models". It implements multiple membership inference and detection methods, calibration/aggregation pipelines, and experiments to evaluate attacks on causal language models (e.g., the Pythia family).
+**Author:** Abinash Selvarajah  
+**Institution:** Ruhr-University Bochum, Chair for Trustworthy Human Language Technologies
+**Year:** 2026
+---
 
-Key features
-- Implements a variety of attack methods and signal extraction utilities (CIMIA, ACMIA/AC, MaxRényi, DCPDD, NoisyNeighbour, TagTab, RelativeLikelihood and OfflineRobustMIA).
-- Tools for dataset preprocessing and chunking at sentence/paragraph/document scales.
-- Calibration signal collection and score aggregation for robust membership inference attacks (MIA).
-- Experiment runner (run.py) to compute per-text and per-document scores and save outputs in JSONL format.
+## Abstract
+Large Language Model (LLM) are trained on large amounts of human-written text, which is automatically scraped from the internet. Although there exist robots.txt that can prohibit the extraction of information, allegedly most developers ignore these and willingly break copyright laws (European Union, 2019), as shown in the legal case between the New York Times and OpenAI (Audrey Pope, 2024) or between various authors and
+Anthropic (Matt O’Brien, 2025). Membership Inference Attack (MIA) were introduced as a method to determine whether a given sample was part of the training set by analyzing the output (Shokri et al., 2017), thereby offering a possible tool to detect copyright violations or private data leakage. The underlying assumption is that the training samples will produce different outputs from the ones not seen during training, because the models weights were optimized using those specific samples. Recent MIA have been shown to be evaluated on ill-designed experiments, in which the training data exhibit a clear distribution shift—such as differences in writing style or time period—relative to the non-training data (Das et al., 2025; Duan et al., 2024; Meeus et al., 2025). Based on the findings of B. Chen et al. (2024), Maini et al. (2024), Meeus et al. (2024), and Puerto et al. (2025), who demonstrate that MIA can still be effective but it heavily depends on the distribution, we instead propose aggregating a dozen different MIAs (Antebi et al., 2025; Carlini et al., 2021; Galli et al., 2024; Shi et al., 2024; Wang et al., 2025; Xie et al., 2025; Zade et al., 2025) to automatically identify the most reliable signals.
 
+Building on the multi-scale aggregation framework of Puerto et al.
+(2025), we extend the original ten features to 644 by integrating reference
+model-based attacks, including Token-Level InfoRMIA (Tao and Shokri, 2025) and the Window-Based Comparison (Y. Chen et al., 2026), and replace the linear map with Logistic Regression, Multi-Layer Perceptron (MLP), Extreme Gradient Boosting (XGBoost) (T. Chen and Guestrin, 2016), Random Forest (Breiman, 2001) and Support Vector Classifier (SVC). We evaluate the resulting attack on Pythia-2.8B and Pythia-6.9B (Biderman, 2022) over eight subsets of The Pile (Gao et al., 2020a), and model fine-tuned with DuoLearn (Tran et al., 2025) defenses.
 
-Repository structure
-- Masterthesis/
-  - run.py — main experiment runner (loads models, collects calibration signals, runs attacks, writes JSONL outputs)
-  - preprocess.py — dataset loading, chunking, batched score computation, TopPref prefix search, calibration and utility functions
-  - scores.py — attack implementations and signal extractors (CIMIA, DCPDD, MaxRenyi, ACMIA, NoisyNeighbour, OfflineRobustMIA, TagTab, etc.)
-  - aggregation.py — small wrappers for classifier aggregation (XGBoost, SVM)
-  - src/config.py — config constants and model name mappings
-  - test.py — legacy/experimental scripts
-  - GPTNeoXTokenizerFast_realnewslike_freq_dist.pkl — token frequency distribution used by DCPDD
-  - LICENSE — license file
+The extended attack raises average collection-level AUROC from 0.535 to 0.845 on Pythia-
+2.8b and reaches near-perfect separation (-> 0.99) on six of the eight subsets when scaled to Pythia-6.9B. The dominant share of this improvement come from the reference model-based attacks rather than to a larger target-only feature set: the Window-Based Comparison by Y. Chen et al. (2026) alone matches the full reference-only feature set on most subsets with only 48 features. 
 
-Requirements
-- Python 3.8+
-- PyTorch (with CUDA if available)
-- transformers
-- datasets
-- scikit-learn
-- xgboost
-- nltk
-- spacy (and language models, e.g., en_core_web_sm)
-- wordfreq
-- sentence_transformers (optional for some tests)
-- pandas, numpy, tqdm
+Evaluating our attack against models protected by DuoLearn Tran et al. (2025) reduces AUROC at an paragraph level, but as the unlearning weight grows, the reduced weak paragraph signals aggregated over many samples on collection level recovers the signal back to near-perfect AUROC. 
 
-Install (example)
+These findings suggest that the membership signal in modern LLM is concentrated in reference-based attacks rather than in target-only features, and that token-level defenses cannot be evaluated only at per-token or per-document granularity if the threat model includes multi-scale aggregation.
 
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu117
-pip install transformers datasets scikit-learn xgboost nltk spacy wordfreq sentence-transformers pandas tqdm
+## Pipeline overview
 
-Note: adapt the PyTorch command to your CUDA and platform configuration.
+![Pipeline overview](Pipeline.png)
 
-Configuration and data
-- The code expects local copies of Hugging Face models and datasets. Many paths are configured in run.py and preprocess.py using HF_DIR and MIA_SCORE_SAVING_DIR. By default these point to the author's filesystem. Edit HF_DIR and MIA_SCORE_SAVING_DIR in run.py or set environment variables accordingly before running.
+## Setup
 
-- run.py expects preprocessed dataset directories at:
-  output_mia/<pythia_model>/<dataset>/members
-  output_mia/<pythia_model>/<dataset>/non_members
+```bash
+git clone <repo>
+cd Masterthesis
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-- After calibration and execution, outputs are written under:
-  output_mia/<pythia_model>/<dataset>/paragraph_<max_length>/mia_members_*.jsonl
-  output_mia/<pythia_model>/<dataset>/paragraph_<max_length>/mia_nonmembers_*.jsonl
-  output_mia/<pythia_model>/<dataset>/document_<max_length>/mia_*.jsonl
+# Download Spacy NER model
+python -m spacy download en_core_web_sm
 
-Usage
-- run.py will automatically collect calibration signals if calibration_signals.json is missing. Example invocation:
+# Required env vars (or use the defaults shown)
+export MIA_ROOT=$PWD/mia_scores          
+export HF_HOME=$PWD/hf_cache             
+export DATASET_DIR=$HF_HOME/datasets/parameterlab
+# Optional overrides
+export PCS_DIR=$MIA_ROOT/results/pcs     
+export DEFENDED_MODELS_ROOT=$PWD/defended_models
+```
 
-python3 run.py --pythia_model pythia-2.8b --max_length 512 --miaset nonmember --dataset YoutubeSubtitles --range 0 100
+## Replication
 
-Arguments
-- --pythia_model: model folder name (e.g., pythia-2.8b)
-- --max_length: chunk length to evaluate (43, 512, 1024, 2048)
-- --miaset: "member" or "nonmember" to process members or non-members
-- --dataset: dataset short name used under output_mia
-- --range: two integers specifying the document range (start end)
+### 1. Download models + data
 
-Important notes
-- Many scripts run in an offline Hugging Face setup (HF_HUB_OFFLINE). Ensure required model files are present in HF_DIR or change local_files_only flags to allow downloads.
-- run.py creates a simple lock directory during calibration to coordinate concurrent jobs.
-- Several file paths in the code are hard-coded to the original author's environment (e.g. /lustre/...). Update these paths before running in your environment.
+```bash
+python -m src.utils.download
+# fetches Pythia-2.8b/6.9b + reference checkpoints (70m/160m/410m/1b)
+# downloads the 8 Pile MIA splits (parameterlab) and chunks them at ctx 43/512/1024/2048
+# add --mimir for the MIMIR n-gram-overlap splits
+```
 
-License
-See the LICENSE file in the repository for the project license and terms.
+### 2. Per-paragraph MIA scores
+
+`precompute_mia_scores` shards by document range, so spawn one job per range
+to parallelise. `--defended <name>` retargets a defended checkpoint, but needs to have the defended models in pre-defined path.
+
+```bash
+python -m src.attacks.precompute_mia_scores \
+    --pythia_model pythia-2.8b --dataset arxiv --max_length 1024 \
+    --miaset member    --range 0 1000 \
+    --member_shot_indices 0,1,2 --nonmember_shot_indices 0,1,2
+
+python -m src.attacks.precompute_mia_scores \
+    --pythia_model pythia-2.8b --dataset arxiv --max_length 1024 \
+    --miaset nonmember --range 0 1000 \
+    --member_shot_indices 0,1,2 --nonmember_shot_indices 0,1,2
+```
+
+Merge the shards into one `members.jsonl` / `nonmembers.jsonl` per (key, ctx):
+
+```bash
+python -m src.utils.merge_jsonl --kind undefended --key pythia-2.8b --ctx 1024
+```
+
+### 3. (Re-)tune aggregator hyperparameters (optional)
+
+The `configs/` folder ships with the tuned values used in the thesis tables.
+Re-run only if you change the feature set or evaluate on a new (model, ctx).
+
+```bash
+python -m src.attacks.aggregator.motivation_lazypredict \
+    --dataset arxiv --ctx 1024 --pythia_model pythia-2.8b
+# -> configs/lazypredict_shortlist.json
+
+python -m src.attacks.aggregator.cv_params \
+    --dataset arxiv --ctx 1024 --pythia_model pythia-2.8b
+# -> configs/cv_params/pythia-2.8b_arxiv_1024.json
+```
+
+### 4. Build the precomputed-score (PCS) files
+
+```bash
+python -m src.attacks.aggregator.extended_aggregator --dataset arxiv --ctx 1024
+python -m src.attacks.aggregator.puerto_baseline     --dataset arxiv --ctx 1024
+python -m src.attacks.aggregator.majority_voting_agg \
+    --dataset arxiv --ctx 1024 --train 1000
+```
+
+PCS files land in `$PCS_DIR/<dataset>/`.
+
+### 5. Aggregate -> AUROC tables
+
+```bash
+python -m src.evaluation.run_stats \
+    --dataset arxiv --ctx 1024 --pcs_type extended_2.8b \
+    --doc_test mwu --coll_test ttest
+
+python -m src.evaluation.run_stats \
+    --dataset arxiv --ctx 1024 --pcs_type puerto_2.8b --train 1000
+```
+
+`--pcs_type` accepts: `extended_2.8b`, `puerto_2.8b`, `extended_6.9b`,
+`puerto_6.9b`, `extended_mimir`, and the per-classifier variants
+`{lr,svc,rf,xgb,mlp}_{2.8b,6.9b}`.
+
+### 6. Defended-model variants
+
+Train a defended checkpoint, then re-run steps 2 - 5 with `--defended <name>`:
+
+```bash
+python -m src.defended.dpsgd    --dataset arxiv --epsilon 8.0
+python -m src.defended.duolearn --dataset arxiv --alpha 0.8 --finetune-ref --gpu 0
+```
+
+The suite includes a smoke check on a fixed Bochum text fixture and synthetic
+sanity checks for the paragraph -> document -> collection aggregation chain.

@@ -1,0 +1,40 @@
+# GridSearchCV grids -- one block per classifier name.
+# Cartesian product of values is searched. Anything not listed -> sklearn default.
+#
+# Edit then re-run:
+#   python -m src.attacks.aggregator.cv_params --dataset arxiv --ctx 1024
+#
+# NOTE: write floats explicitly (1.0e-5 not 1e-5) to avoid YAML's silent
+# string-vs-float quirk.
+
+LogisticRegression:
+  C: [0.001, 0.01, 0.1, 1.0, 10.0]
+  penalty: ["l1", "l2"]
+  solver: ["saga", "liblinear"]
+
+SVC:
+  C: [0.1, 1.0, 10.0]
+  kernel: ["rbf", "linear"]
+  gamma: ["scale", "auto"]
+
+RandomForest:
+  n_estimators: [100, 200, 500]
+  max_depth: [null, 10, 20]
+  min_samples_leaf: [1, 2, 5]
+
+XGBoost:
+  n_estimators: [100, 200, 500]
+  max_depth: [4, 6, 8]
+  learning_rate: [0.05, 0.1, 0.2]
+  subsample: [0.8, 1.0]
+  colsample_bytree: [0.8, 1.0]
+
+# MLP grid is consumed by src/attacks/aggregator/extended_aggregator.py which
+# trains a small torch MLP (BatchNorm + Dropout). Not the sklearn MLPClassifier.
+MLP:
+  n_layers: [1, 2]
+  hidden_width: [128, 256, 512]
+  reg_type: ["L1", "L2"]
+  reg_strength: [1.0e-5, 1.0e-4, 1.0e-3]
+  dropout: [0.1, 0.3, 0.5]
+  lr: [1.0e-3, 1.0e-4]

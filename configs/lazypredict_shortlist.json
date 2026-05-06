@@ -1,0 +1,7 @@
+[
+  "LogisticRegression",
+  "SVC",
+  "RandomForest",
+  "XGBoost",
+  "MLP"
+]

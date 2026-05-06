@@ -1,0 +1,29 @@
+{
+  "LogisticRegression": {
+    "C": 0.01,
+    "penalty": "l1",
+    "solver": "saga"
+  },
+  "SVC": {
+    "C": 1.0,
+    "gamma": "auto",
+    "kernel": "rbf"
+  },
+  "RandomForest": {
+    "ccp_alpha": 0.0,
+    "class_weight": "balanced",
+    "max_depth": 10,
+    "max_features": 0.5,
+    "min_samples_leaf": 5,
+    "min_samples_split": 5,
+    "n_estimators": 2000
+  },
+  "XGBoost": {
+    "colsample_bytree": 0.7,
+    "learning_rate": 0.001,
+    "max_depth": 7,
+    "n_estimators": 1000,
+    "reg_lambda": 0.1,
+    "subsample": 0.8
+  }
+}
