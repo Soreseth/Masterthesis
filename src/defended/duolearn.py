@@ -399,6 +399,24 @@ class CachedDuoLearnTrainer(Trainer):
         return eval_dataloader
 
     def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False):
+        """DuoLearn dual-purpose loss with cached reference per-token losses.
+
+        At training time the per-token cross-entropy is split into a "hard"
+        bucket (top-k by `target_loss - ref_loss`, learned normally) and a
+        "memorised" bucket (bottom-k, unlearned with weight `-self.alpha`):
+        ``L_dual = mean(CE_hard) - alpha * mean(CE_mem)``. At eval time the
+        cached ref losses are dropped and standard CE is returned.
+
+        Args:
+            model: The target HF causal-LM being fine-tuned.
+            inputs: HF batch dict; in train mode must include
+                ``ref_token_losses`` (per-token CE under the reference model,
+                aligned with ``inputs["labels"]``).
+            num_items_in_batch: Accepted for HF Trainer signature compatibility;
+                unused.
+            return_outputs: If True, return ``(loss, model_outputs)``;
+                otherwise just the scalar loss tensor.
+        """
         # During evaluation, use standard loss (no ref_token_losses in eval data)
         if not model.training:
             # Remove ref_token_losses if present (shouldn't be, but safety check)

@@ -22,6 +22,15 @@ N_TRAIN = 1000
 
 
 def plot_bar(names, values, out_path, xlim=None):
+    """Save a horizontal bar plot of feature importances on a log x-axis.
+
+    Args:
+        names: Iterable of feature names (top-to-bottom in the plot).
+        values: Iterable of mean(|SHAP|) values aligned with `names`.
+        out_path: PNG file path to write.
+        xlim: Optional (xmin, xmax) for the log x-axis. If None, matplotlib
+            picks the bounds.
+    """
     fig, ax = plt.subplots(figsize=(8, max(4, 0.28 * len(names))))
     ax.barh(range(len(names)), values, color="#1f77b4")
     ax.set_yticks(range(len(names)))
@@ -38,6 +47,16 @@ def plot_bar(names, values, out_path, xlim=None):
 
 
 def common_log_xlim(values, pad=1.15):
+    """Pick (xmin, xmax) for a log axis covering the strictly-positive entries.
+
+    Args:
+        values: 1-D numpy array of feature importances (may contain zeros).
+        pad: Multiplicative padding factor applied to the min (divide) and
+            max (multiply) so bars don't touch the axis edges.
+
+    Returns:
+        Tuple (xmin, xmax), or None if `values` has no positive entries.
+    """
     nz = values[values > 0]
     if nz.size == 0:
         return None
@@ -45,6 +64,21 @@ def common_log_xlim(values, pad=1.15):
 
 
 def aggregate_dataset(dataset, ctx, top_n, bottom_n, expected_seeds):
+    """Average the per-seed SHAP files for one dataset and emit JSON/CSV/PNG.
+
+    Reads ``{OUT_DIR}/{dataset}/per_seed/seed*_train{N_TRAIN}_ctx{ctx}.json``,
+    averages the per-feature mean(|SHAP|) across seeds, and writes the
+    seed-averaged JSON, a sorted CSV, and bar plots for the top-N and
+    bottom-N features.
+
+    Args:
+        dataset: Pile subset name, e.g. ``"arxiv"``.
+        ctx: Context length (43, 512, 1024, 2048).
+        top_n: Number of highest-importance features to plot.
+        bottom_n: Number of lowest-importance (still positive) features to plot.
+        expected_seeds: Iterable of seed ids that should be present; missing
+            seeds trigger a WARNING but are not fatal.
+    """
     in_dir = f"{OUT_DIR}/{dataset}/per_seed"
     pattern = f"{in_dir}/seed*_train{N_TRAIN}_ctx{ctx}.json"
     files = sorted(glob.glob(pattern))

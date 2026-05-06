@@ -5,9 +5,10 @@ Precompute per-paragraph MIA scores using ALL chunks per document with extended 
 Example Usage:
     python precompute_paragraph_scores_all_chunk.py --dataset arxiv --seed 670487 --ctx 2048
 """
-import sys, os, json, re, argparse
+import sys, os, json, re, argparse, time
 import numpy as np
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -145,17 +146,33 @@ def run_seed(dataset, seed, members, non_members, cv_params):
             models_to_train[m_name] = {"params": DEFAULT_PARAMS[m_name], "is_puerto": False}
 
     trained = {}
+    training_results = {}
     for m_name, m_info in models_to_train.items():
         model = create_model(m_name, m_info["params"], seed)
         X_train = X_A_prt_scaled if m_info["is_puerto"] else X_A_ext_scaled
+        t0 = time.perf_counter()
         model.fit(X_train, y_A)
+        fit_seconds = time.perf_counter() - t0
+        train_scores = get_scores(model, m_name, X_train)
+        train_auroc = float(roc_auc_score(y_A, train_scores))
         trained[m_name] = {
             "model": model,
             "scaler": scaler_prt if m_info["is_puerto"] else scaler_ext,
             "is_puerto": m_info["is_puerto"],
             "transform_fn": None if m_info["is_puerto"] else transform_fn,
         }
-        print(f"    Trained {m_name}")
+        training_results[m_name] = {
+            "train_auroc": train_auroc,
+            "fit_seconds": float(fit_seconds),
+            "n_train_paragraphs": int(X_train.shape[0]),
+            "n_features": int(X_train.shape[1]),
+            "n_pos": int((y_A == 1).sum()),
+            "n_neg": int((y_A == 0).sum()),
+            "feature_set": "puerto" if m_info["is_puerto"] else "extended",
+            "params": m_info["params"],
+        }
+        print(f"    Trained {m_name}  (train AUROC = {train_auroc:.4f}, "
+              f"fit = {fit_seconds:.1f}s)")
 
     known_scores = {}
     for m_name, m_info in trained.items():
@@ -205,6 +222,7 @@ def run_seed(dataset, seed, members, non_members, cv_params):
         },
         "models": list(trained.keys()),
         "model_params": {m: models_to_train[m]["params"] for m in trained},
+        "training_results": training_results,
         "known_scores": known_scores,
         "eval_members": eval_members,
         "eval_non_members": eval_non_members,

@@ -41,14 +41,32 @@ def _build_estimator(name: str, params: dict, seed: int = 42):
 
 
 def grid_search(name: str, X, y, grid: dict, n_splits: int = 5, seed: int = 42):
-    """Run GridSearchCV on `name` with `grid` on (X, y). Returns best params."""
+    """
+    Run GridSearchCV on `name` with `grid` on (X, y). Returns
+    (best_params, cv_results) where cv_results is a list of one dict per
+    candidate configuration (params + per-fold scores + mean/std/rank).
+    """
     base = _build_estimator(name, {}, seed=seed)
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     print(f"  GridSearchCV: {name}  ({len(list(_param_grid_size(grid)))} configs)")
     gs = GridSearchCV(base, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=False)
     gs.fit(X, y)
     print(f"    best ROC AUC = {gs.best_score_:.4f}  with {gs.best_params_}")
-    return gs.best_params_
+
+    cvr = gs.cv_results_
+    n = len(cvr["params"])
+    split_keys = [f"split{i}_test_score" for i in range(n_splits)]
+    cv_results = [
+        {
+            "params": cvr["params"][i],
+            "mean_test_score": float(cvr["mean_test_score"][i]),
+            "std_test_score":  float(cvr["std_test_score"][i]),
+            "rank_test_score": int(cvr["rank_test_score"][i]),
+            "split_test_scores": [float(cvr[k][i]) for k in split_keys],
+        }
+        for i in range(n)
+    ]
+    return gs.best_params_, cv_results
 
 
 def _param_grid_size(grid: dict):
@@ -80,20 +98,41 @@ def main():
         grids = yaml.safe_load(f)
 
     print(f"\nClassifiers to tune ({len(shortlist)}): {shortlist}")
-    out = {}
+    best_params_per_clf = {}
+    cv_results_per_clf = {}
     for clf_name in shortlist:
         if clf_name not in grids:
             print(f"  [skip] no grid in {args.grids} for {clf_name}")
             continue
         try:
-            out[clf_name] = grid_search(clf_name, X, y, grids[clf_name], seed=args.seed)
+            best_params, cv_results = grid_search(
+                clf_name, X, y, grids[clf_name], seed=args.seed)
+            best_params_per_clf[clf_name] = best_params
+            cv_results_per_clf[clf_name] = cv_results
         except Exception as e:
             print(f"  ! {clf_name} failed: {e}")
 
-    out_path = Path(args.out_dir) / f"{args.pythia_model}_{args.dataset}_{args.ctx}.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(out, indent=2, default=str))
-    print(f"\n-> {out_path}")
+    base = f"{args.pythia_model}_{args.dataset}_{args.ctx}"
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Existing schema: {clf_name: best_params}. extended_aggregator's loader
+    # depends on this shape, so don't change it.
+    best_path = out_dir / f"{base}.json"
+    best_path.write_text(json.dumps(best_params_per_clf, indent=2, default=str))
+    print(f"\n-> {best_path}")
+
+    # Sidecar with full per-config CV scores (the diagram's "Validation Results").
+    cvr_path = out_dir / f"{base}.cv_results.json"
+    cvr_path.write_text(json.dumps({
+        "dataset": args.dataset,
+        "pythia_model": args.pythia_model,
+        "ctx": args.ctx,
+        "seed": args.seed,
+        "scoring": "roc_auc",
+        "cv_results": cv_results_per_clf,
+    }, indent=2, default=str))
+    print(f"-> {cvr_path}")
 
 
 if __name__ == "__main__":

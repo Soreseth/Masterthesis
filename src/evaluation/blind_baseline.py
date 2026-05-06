@@ -30,6 +30,16 @@ from sklearn.metrics import roc_curve, auc
 # ----------------------------------------------------------------------
 
 def get_roc_auc(y_true, y_pred_proba):
+    """ROC AUC computed via `roc_curve` + trapezoidal `auc`.
+
+    Args:
+        y_true: 1-D array of binary labels (0 = non-member, 1 = member).
+        y_pred_proba: 1-D array of decision scores aligned with `y_true`.
+            Higher values should indicate "more likely to be a member".
+
+    Returns:
+        Float ROC AUC in [0, 1].
+    """
     fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
     return auc(fpr, tpr)
 

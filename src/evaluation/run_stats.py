@@ -177,6 +177,19 @@ def evaluate_collection(pcs, model_name, coll_size, seed,
 
     # Sample collections using random.Random (matching Puerto)
     def sample_collections(docs_scores, n_colls, cs, s):
+        """Draw `n_colls` collections of size `cs` (without replacement when
+        the pool is large enough; with replacement otherwise) using a fresh
+        `random.Random(s)` so the sampling is reproducible per seed.
+
+        Args:
+            docs_scores: List indexable by doc_id; only its length is used.
+            n_colls: Number of collections to draw.
+            cs: Collection size (docs per collection).
+            s: Integer seed for `random.Random`.
+
+        Returns:
+            List of `n_colls` lists, each containing `cs` doc indices.
+        """
         rng = random.Random(s)
         indices = list(range(len(docs_scores)))
         collections = []

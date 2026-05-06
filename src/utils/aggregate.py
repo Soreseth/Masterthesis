@@ -93,7 +93,23 @@ def parse_args():
 
 
 def build_config(args):
-    """Build config dict from argparse args."""
+    """Build the global config dict consumed by the rest of the pipeline.
+
+    Resolves input/output directories, the (train, known) sweep sizes, the
+    Puerto feature list, and the chosen statistical-test subdirectory under
+    `output_dir`. Side effect: creates `output_dir` on disk.
+
+    Args:
+        args: argparse.Namespace from `parse_args()` -- expects at minimum
+            `base_dir`, `model`, `dataset`, `output_dir`, `output_subdir`,
+            `stat_test`, `context_sizes`, `seeds`, `n_train_docs`,
+            `n_known_docs`, `tune_hyperparameters`, `n_cv_folds`,
+            `feature_mode`, `n_pca_components`, `aggregation_levels`.
+
+    Returns:
+        Dict with the resolved paths, sweep lists, feature-mode flags, and
+        the model/dataset metadata.
+    """
     input_dir = os.path.join(args.base_dir, args.model, args.dataset)
     output_dir = args.output_dir or os.path.join("results", args.model, args.dataset)
     if args.output_subdir:
@@ -174,9 +190,22 @@ def build_config(args):
 # --------------------------------------------------------------
 
 def load_jsonl_documents(path, label, max_docs=None):
-    """
-    Load JSONL file and return list of documents.
-    Each document is a list of paragraph feature dicts.
+    """Load a JSONL file produced by `merge_jsonl.py` into per-doc paragraph lists.
+
+    Each line is one document with a `pred` (or `preds`) field. If `pred` is a
+    list of dicts, each entry becomes one paragraph; if it's a single dict,
+    the document has one paragraph.
+
+    Args:
+        path: Path to the JSONL file (one doc per line).
+        label: Membership label to attach to every paragraph (1 = member,
+            0 = non-member).
+        max_docs: Optional cap on number of documents to load. `None` =
+            no cap.
+
+    Returns:
+        List of documents, where each document is a list of
+        `{"pred": <feat_dict>, "label": <int>}` paragraph entries.
     """
     documents = []
     with open(path) as f:
@@ -199,8 +228,7 @@ def load_jsonl_documents(path, label, max_docs=None):
 
 
 def split_documents_puerto(members, non_members, config, seed):
-    """
-    Apply Puerto et al.'s document-level split with fixed eval set.
+    """Apply Puerto et al.'s document-level split with a fixed eval set.
 
     The eval set (B partition) is ALWAYS the same regardless of n_train_docs
     or n_known_docs. This is achieved by:
@@ -215,11 +243,23 @@ def split_documents_puerto(members, non_members, config, seed):
       Members:     [ A_pool (max_train) | discarded (max_known_total) | B (eval) ]
       Non-members: [ A_pool (max_train) | Known_pool (max_known_total) | B (eval) ]
 
-    Config keys used:
-      - n_train_docs: actual training docs to use (subsampled from A_pool)
-      - n_known_docs: actual known docs to use (subsampled from Known_pool)
-      - n_train_docs_sweep[0]: max training pool size (= largest train size)
-      - n_known_docs_sweep[0]: max known pool size
+    Args:
+        members: List of member documents (each a list of paragraph dicts),
+            as returned by `load_jsonl_documents(..., label=1)`.
+        non_members: List of non-member documents, same structure.
+        config: Dict; uses `n_train_docs` (actual training docs to use,
+            subsampled from A_pool), `n_known_docs` (actual known docs,
+            subsampled from Known_pool), `n_train_docs_sweep[0]` (max
+            training pool size = largest train size), and
+            `n_known_docs_sweep[0]` (max known pool size).
+        seed: Integer seed for the `np.random.RandomState` used to shuffle
+            and subsample.
+
+    Returns:
+        Dict with keys `A_members_para`, `A_non_members_para`,
+        `A_members_doc_ids`, `A_non_members_doc_ids`,
+        `known_non_members_para`, `known_non_members_docs`,
+        `all_known_for_sweep_docs`, `B_members_docs`, `B_non_members_docs`.
     """
     n_train = config["n_train_docs"]  # actual training size (may be < max)
     n_known = config["n_known_docs"]  # actual known size
@@ -303,7 +343,24 @@ def split_documents_puerto(members, non_members, config, seed):
 
 
 def load_data_for_context_size(context_size, config):
-    """Load raw documents for a given context size."""
+    """Load member + non-member docs for one context length from `input_dir`.
+
+    Reads `<input_dir>/document_<ctx>/members_<ctx>.jsonl` and
+    `<input_dir>/document_<ctx>/nonmembers_<ctx>.jsonl`.
+
+    Args:
+        context_size: Token context length used in the filename
+            (one of 43, 512, 1024, 2048).
+        config: Dict; uses `input_dir` and the optional cap
+            `max_docs_per_class`.
+
+    Returns:
+        `(members, non_members)` -- two lists of documents
+        (each document is itself a list of paragraph dicts).
+
+    Raises:
+        FileNotFoundError: If either expected JSONL file is missing.
+    """
     input_dir = config["input_dir"]
     max_docs = config.get("max_docs_per_class", None)
 
@@ -338,7 +395,18 @@ def load_data_for_context_size(context_size, config):
 # --------------------------------------------------------------
 
 def compute_derived_features(pred, derived_config):
-    """Compute derived features from existing ones."""
+    """Add derived features to `pred` in place via simple binary ops.
+
+    Args:
+        pred: Mutable dict of `{feature_name: value}` for one paragraph.
+            Modified in place; new keys from `derived_config` are inserted.
+        derived_config: Dict mapping `derived_name -> (feat1, feat2, op)`.
+            `op` is one of `"divide"`, `"subtract"`, `"multiply"`. For
+            `"divide"`, divide-by-zero / NaN denominators write `0.0`.
+
+    Returns:
+        The same `pred` dict (also mutated in place).
+    """
     for derived_name, (feat1, feat2, op) in derived_config.items():
         val1 = pred.get(feat1, np.nan)
         val2 = pred.get(feat2, np.nan)
@@ -403,15 +471,19 @@ def extract_features(paragraphs, feature_names=None, derived_config=None):
 KEEP_REF_STEPS = ["step1", "final"]
 
 def filter_reference_features(feature_keys):
-    """
-    Filter reference-model features to keep only step1 and final.
-    
-    Reference features follow patterns like:
-      - ref_loss_diff_70m_step1
-      - wbc_70m_final_w1
-      - tl_informia_70m_step1_t0.5_mk5
-    
-    Returns: List of feature keys to keep
+    """Drop intermediate-checkpoint reference features, keep only step1 + final.
+
+    Reference features follow patterns like ``ref_loss_diff_70m_step1``,
+    ``wbc_70m_final_w1``, ``tl_informia_70m_step1_t0.5_mk5``. Anything with
+    a checkpoint other than ``step1`` or ``final`` is dropped. ``ref_loss_diff_*``,
+    ``mod_renyi_*`` and ``modified_entropies_mean`` are excluded entirely
+    (superseded by better alternatives).
+
+    Args:
+        feature_keys: Iterable of feature-name strings.
+
+    Returns:
+        Filtered list of feature names (order preserved).
     """
     import re
     ref_prefixes = ['ref_loss_', 'wbc_', 'tl_informia_']
@@ -850,9 +922,27 @@ def get_hyperparameter_grids():
     }
 
 def tune_model_cv(model_name, X_train, y_train, groups=None, n_folds=5, seed=42):
-    """
-    Tune hyperparameters for a single model using cross-validation.
-    Note: CV tuning always uses sklearn (CPU) since GridSearchCV needs sklearn-compatible estimators.
+    """GridSearchCV over the predefined grid for `model_name`, scored by ROC AUC.
+
+    CV tuning always runs on CPU sklearn since `GridSearchCV` needs
+    sklearn-compatible estimators.
+
+    Args:
+        model_name: One of `"PuertoLinearMap"`, `"LogisticRegression"`,
+            `"SVC"`, `"RandomForest"`, `"XGBoost"`. Anything else returns
+            empty results.
+        X_train: 2-D array of features `(n_samples, n_features)`.
+        y_train: 1-D array of binary labels.
+        groups: Optional group ids for `StratifiedGroupKFold` (e.g. doc ids
+            to keep paragraphs of the same doc in the same fold). When
+            `None`, plain `StratifiedKFold` is used.
+        n_folds: Number of CV folds.
+        seed: Random state for the folder + base estimators.
+
+    Returns:
+        `(best_params, best_score, cv_results_df)`. `(.., None, None)` is
+        returned for unknown `model_name`. `cv_results_df` is a pandas
+        DataFrame sorted by `rank_test_score`.
     """
 
     grids = get_hyperparameter_grids()
@@ -913,7 +1003,22 @@ def tune_model_cv(model_name, X_train, y_train, groups=None, n_folds=5, seed=42)
 
     
 def create_tuned_model(model_name, best_params, seed=42):
-    """Create a model instance with tuned hyperparameters."""
+    """Instantiate the named estimator with sensible defaults + `best_params`.
+
+    Args:
+        model_name: One of `"PuertoLinearMap"`, `"LogisticRegression"`,
+            `"SVC"`, `"RandomForest"`, `"XGBoost"`.
+        best_params: Dict of hyperparameter overrides (typically
+            `tune_model_cv()`'s first return value). Overrides win against
+            the per-estimator defaults.
+        seed: `random_state` passed to the estimator.
+
+    Returns:
+        A fresh sklearn / XGBoost estimator (not yet fitted).
+
+    Raises:
+        ValueError: If `model_name` is not one of the supported values.
+    """
     from sklearn.linear_model import LogisticRegression
     from sklearn.svm import SVC
     from sklearn.ensemble import RandomForestClassifier
@@ -962,10 +1067,29 @@ def create_tuned_model(model_name, best_params, seed=42):
 # --------------------------------------------------------------
 
 def get_paragraph_scores(model, scaler, paragraphs, feature_names, derived_config, feature_mode, all_feature_keys=None, transform_fn=None):
-    """
-    Get paragraph-level scores from trained model.
-    
-    Returns: np.array of shape (n_paragraphs,)
+    """Score every paragraph with `model` after extracting + scaling features.
+
+    Picks `decision_function` when available, else `predict_proba(...)[:, 1]`.
+
+    Args:
+        model: A fitted sklearn-compatible classifier.
+        scaler: A fitted `StandardScaler` (or compatible) for the features
+            consumed by `model`.
+        paragraphs: List of `{"pred": <feat_dict>, "label": ...}` dicts.
+        feature_names: Subset of features to extract (for `feature_mode="puerto"`).
+            Ignored in `"extended"` mode.
+        derived_config: Derived-feature spec passed to `compute_derived_features`.
+        feature_mode: `"puerto"` (use `feature_names` only) or `"extended"`
+            (extract `all_feature_keys`, pad to width, then `transform_fn`).
+        all_feature_keys: Full ordered feature list expected in extended mode.
+            Required when `feature_mode="extended"`.
+        transform_fn: Callable applied to the raw extended-feature matrix
+            (e.g. the GroupPCA-on-CAMIA reducer). Required when
+            `feature_mode="extended"`.
+
+    Returns:
+        np.ndarray of shape `(n_paragraphs,)` -- one membership score per
+        paragraph (higher = more member-like).
     """
     if feature_mode == "puerto":
         X, _, _ = extract_features(paragraphs, feature_names, derived_config)
@@ -1028,11 +1152,25 @@ def get_paragraph_scores(model, scaler, paragraphs, feature_names, derived_confi
     return scores
 
 
-def evaluate_paragraph_level(model, scaler, B_members_docs, B_non_members_docs, 
-                             feature_names, derived_config, feature_mode, 
+def evaluate_paragraph_level(model, scaler, B_members_docs, B_non_members_docs,
+                             feature_names, derived_config, feature_mode,
                              all_feature_keys=None, transform_fn=None):
-    """
-    Paragraph-level evaluation: Direct AUROC on individual paragraphs.
+    """Direct AUROC on individual paragraphs of the eval (B) partition.
+
+    Args:
+        model: Fitted classifier (see `get_paragraph_scores`).
+        scaler: Fitted feature scaler.
+        B_members_docs: Eval-member documents (each a list of paragraphs).
+        B_non_members_docs: Eval-non-member documents.
+        feature_names: Feature subset for puerto mode (see `get_paragraph_scores`).
+        derived_config: Derived-feature spec.
+        feature_mode: `"puerto"` or `"extended"`.
+        all_feature_keys: Required in extended mode.
+        transform_fn: Required in extended mode.
+
+    Returns:
+        Dict with `auroc`, `tpr_at_{5,1,0.1,0.01}pct_fpr`, `n_samples`,
+        `level="paragraph"`, plus the raw `_y_true` / `_y_score` arrays.
     """
     # Flatten all paragraphs
     B_members_para = [para for doc in B_members_docs for para in doc]
@@ -1092,15 +1230,31 @@ def evaluate_document_level(model, scaler, B_members_docs, B_non_members_docs,
                             known_non_members_para, feature_names, derived_config,
                             feature_mode, all_feature_keys=None, transform_fn=None,
                             stat_test="mwu_ttest"):
-    """
-    Document-level evaluation using statistical test.
+    """Document-level AUROC: per-doc test statistic vs the known reference.
 
-    For each document:
-      1. Get paragraph scores
-      2. Compare against known non-member paragraph scores
-      3. Use test statistic as document score
+    For each eval document, score its paragraphs, run a one-sided
+    test against `known_non_members_para`'s scores, and use the resulting
+    test statistic as the document-level membership score. AUROC is computed
+    across documents. Documents with `<2` paragraphs are skipped.
 
-    stat_test: 'mwu_ttest' (Mann-Whitney U) or 'brunnermunzel' (BM W-stat)
+    Args:
+        model: Fitted classifier.
+        scaler: Fitted feature scaler.
+        B_members_docs: Eval-member documents.
+        B_non_members_docs: Eval-non-member documents.
+        known_non_members_para: Held-out non-member paragraphs that form the
+            reference distribution.
+        feature_names: Puerto-mode feature subset (see `get_paragraph_scores`).
+        derived_config: Derived-feature spec.
+        feature_mode: `"puerto"` or `"extended"`.
+        all_feature_keys: Required in extended mode.
+        transform_fn: Required in extended mode.
+        stat_test: `"mwu_ttest"` (Mann-Whitney U) or `"brunnermunzel"` (the
+            BM W-statistic, sign-flipped so larger = more member-like).
+
+    Returns:
+        Same shape as `evaluate_paragraph_level`'s return value, but with
+        `level="document"` and statistics computed per-document.
     """
     known_scores = get_paragraph_scores(
         model, scaler, known_non_members_para, feature_names, derived_config,
@@ -1178,10 +1332,21 @@ def evaluate_document_level(model, scaler, B_members_docs, B_non_members_docs,
 
 
 def sample_collections(docs, n_collections, docs_per_collection, seed):
-    """
-    Sample collections of documents.
-    Each collection is a list of docs_per_collection documents.
-    Uses random.sample to match Puerto et al.'s original implementation.
+    """Draw `n_collections` collections of `docs_per_collection` documents.
+
+    Sampling is without replacement when `len(docs) >= docs_per_collection`,
+    with replacement otherwise. Uses `random.Random(seed)` to match Puerto
+    et al.'s reference implementation.
+
+    Args:
+        docs: List of documents to sample from.
+        n_collections: Number of collections to draw.
+        docs_per_collection: Size of each collection.
+        seed: Integer seed for `random.Random`.
+
+    Returns:
+        List of `n_collections` lists, each containing `docs_per_collection`
+        document objects (referenced, not copied).
     """
     import random
     rng = random.Random(seed)
@@ -1204,10 +1369,33 @@ def evaluate_collection_level(model, scaler, B_members_docs, B_non_members_docs,
                               feature_mode, config, seed,
                               all_feature_keys=None, transform_fn=None,
                               stat_test="mwu_ttest"):
-    """
-    Collection-level evaluation using statistical test.
+    """Collection-level AUROC: per-collection test statistic vs the reference.
 
-    stat_test: 'mwu_ttest' (Student's t-test) or 'brunnermunzel' (BM W-stat)
+    Samples `config["num_collections"]` member and non-member collections of
+    size `config["docs_per_collection"]` (defaults: 100 and 50), pools each
+    collection's paragraphs, runs a one-sided test against the reference,
+    and computes AUROC across collections.
+
+    Args:
+        model: Fitted classifier.
+        scaler: Fitted feature scaler.
+        B_members_docs: Eval-member documents.
+        B_non_members_docs: Eval-non-member documents.
+        known_non_members_para: Reference paragraphs.
+        feature_names: Puerto-mode feature subset.
+        derived_config: Derived-feature spec.
+        feature_mode: `"puerto"` or `"extended"`.
+        config: Dict; uses `num_collections` and `docs_per_collection`.
+        seed: Seed for `sample_collections` (members get `seed`,
+            non-members get `seed + 1`).
+        all_feature_keys: Required in extended mode.
+        transform_fn: Required in extended mode.
+        stat_test: `"mwu_ttest"` (Student's t-test) or `"brunnermunzel"`
+            (BM W-statistic, sign-flipped).
+
+    Returns:
+        Same shape as `evaluate_paragraph_level`, with `level="collection"`
+        and `collection_size` metadata.
     """
     n_collections = config.get("num_collections", 100)
     docs_per_collection = config.get("docs_per_collection", 50)
@@ -1532,14 +1720,32 @@ def run_collection_size_sweep(model, scaler, B_members_docs, B_non_members_docs,
                               feature_mode, config, seed,
                               all_feature_keys=None, transform_fn=None,
                               collection_sizes=None, stat_test="mwu_ttest"):
-    """
-    Sweep over collection sizes to show compounding effect.
-    
-    Also returns paragraph-level AUROC as baseline.
-    
+    """Run `evaluate_collection_level` for a sweep of collection sizes.
+
+    Also emits a paragraph-level AUROC entry (encoded as `collection_size=0`)
+    so the returned table shows the compounding-with-scale effect end-to-end.
+
+    Args:
+        model: Fitted classifier.
+        scaler: Fitted feature scaler.
+        B_members_docs: Eval-member documents.
+        B_non_members_docs: Eval-non-member documents.
+        known_non_members_para: Reference paragraphs.
+        feature_names: Puerto-mode feature subset.
+        derived_config: Derived-feature spec.
+        feature_mode: `"puerto"` or `"extended"`.
+        config: Dict; uses `num_collections` (defaults to 100).
+        seed: Seed for `sample_collections` (offset by 1 for non-members).
+        all_feature_keys: Required in extended mode.
+        transform_fn: Required in extended mode.
+        collection_sizes: Iterable of collection sizes to sweep. Defaults to
+            `[1, 5, 10, 20, 50, 100, 150, 200, 300, 400, 500]`.
+        stat_test: `"mwu_ttest"` or `"brunnermunzel"` (passed to `_coll_stat`).
+
     Returns:
-        DataFrame with columns: collection_size, auroc, auroc_std, ...
-        (collection_size=0 represents paragraph-level baseline)
+        List of result dicts (one per collection size, plus the
+        paragraph baseline at `collection_size=0`) -- each with `auroc`,
+        `tpr_at_*`, and `level`.
     """
     if collection_sizes is None:
         collection_sizes = [1, 5, 10, 20, 50, 100, 150, 200, 300, 400, 500]
@@ -2032,7 +2238,19 @@ def run_single_seed_experiment(members, non_members, seed, ctx_size, config, agg
 
 
 def aggregate_across_seeds(all_seed_results, ctx_size):
-    """Aggregate results across seeds to get mean ± std."""
+    """Reduce per-seed evaluation rows into mean / std per model.
+
+    Args:
+        all_seed_results: List of per-seed result dicts. Each row must
+            include `model`, `auroc`, `tpr_at_1pct_fpr`, `level`; optional
+            keys `tpr_at_5pct_fpr`, `tpr_at_0.1pct_fpr`, `tpr_at_0.01pct_fpr`
+            are aggregated when present.
+        ctx_size: Context length to stamp on every output row.
+
+    Returns:
+        pandas.DataFrame sorted by `auroc_mean` descending, one row per
+        model with `*_mean` / `*_std` for each metric and `n_seeds`.
+    """
     df = pd.DataFrame(all_seed_results)
     
     agg_results = []
@@ -2062,7 +2280,16 @@ def aggregate_across_seeds(all_seed_results, ctx_size):
 
 
 def print_model_comparison(cv_summary, context_size, aggregation_level):
-    """Print model comparison table."""
+    """Pretty-print a model-comparison table sorted by mean AUROC.
+
+    Args:
+        cv_summary: DataFrame with `model`, `auroc_mean`, `auroc_std`,
+            `tpr_at_1pct_fpr_mean`, `tpr_at_1pct_fpr_std` columns
+            (typically the output of `aggregate_across_seeds`).
+        context_size: Context length to print in the header.
+        aggregation_level: Label for the header (e.g. `"paragraph"`,
+            `"document"`, `"collection"`).
+    """
     df = cv_summary.sort_values("auroc_mean", ascending=False)
     print(f"\n  Model Comparison -- {aggregation_level.upper()}-level (ctx={context_size})")
     print(f"  {'Model':<25} {'AUROC':>14} {'TPR@1%FPR':>14}")
