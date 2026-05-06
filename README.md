@@ -34,12 +34,12 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-# Download Spacy NER model
+### Download Spacy NER model
 ```bash
 python -m spacy download en_core_web_sm
 ```
 
-# The script need to have access to various dir locations to save and load datasets/models. If the hf_dir is not in the same folder as this dir, then set a custom path. 
+### The script need to have access to various dir locations to save and load datasets/models. If the hf_dir is not in the same folder as this dir, then set a custom path. 
 ```
 export MIA_ROOT=$PWD/mia_scores          
 export HF_HOME=$PWD/hf_cache             
