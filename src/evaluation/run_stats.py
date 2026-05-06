@@ -3,10 +3,8 @@
 Aggregate precomputed paragraph scores (PCS) into document- and collection-level AUROCs.
 
 Loads precomputed per-paragraph MIA scores and applies statistical tests
-without retraining any models. Supports all PCS variants:
-  - Extended (precomputed_scores_ctx*_train*_seed*.json)
-  - Puerto  (precomputed_scores_puerto_ctx*_train*_seed*.json)
-  - MLP     (precomputed_scores_mlp_ctx*_train*_seed*.json)
+without retraining any models. Supports the bundled-classifier and
+per-classifier PCS variants for Pythia-2.8b, Pythia-6.9b, and MIMIR.
 
 Statistical tests:
   - Document level: Mann-Whitney U (mwu) or Brunner-Munzel (bm)
@@ -16,9 +14,9 @@ Uses vectorized implementations from vectorized_stats.py for speed.
 Collection sampling uses random.Random(seed) to match Puerto et al.
 
 Usage:
-    python aggregate_from_pcs.py --dataset arxiv --ctx 1024 --pcs_type extended
-    python aggregate_from_pcs.py --dataset arxiv --ctx 1024 --pcs_type puerto --train 1000
-    python aggregate_from_pcs.py --dataset arxiv --ctx 1024 --pcs_type mlp --seed 670487
+    python -m src.evaluation.run_stats --dataset arxiv --ctx 1024 --pcs_type extended_2.8b
+    python -m src.evaluation.run_stats --dataset arxiv --ctx 1024 --pcs_type puerto_2.8b --train 1000
+    python -m src.evaluation.run_stats --dataset arxiv --ctx 1024 --pcs_type mlp_2.8b --seed 670487
 """
 
 import sys, os, json, argparse, random
@@ -37,69 +35,47 @@ OUT_DIR = os.environ.get(
     os.path.join(os.environ.get("MIA_ROOT", "./mia_scores"), "results", "pythia-2.8b"),
 )
 
+# On-disk filename prefixes per variant.
 PCS_PREFIXES = {
-    "extended": "precomputed_scores_ctx",
-    "puerto":   "precomputed_scores_puerto_ctx",
-    "mlp":      "precomputed_scores_mlp_ctx",
-    "puerto_fc": "precomputed_scores_puerto_fc_ctx",
-    "extended_fc": "precomputed_scores_fc_ctx",
-    "mlp_fc":   "precomputed_scores_mlp_fc_ctx",
-    "extended_6.9b": "precomputed_scores_6.9b_ctx",
-    "puerto_6.9b":   "precomputed_scores_puerto_6.9b_ac_ctx",
-    "extended_2.8b_ac": "precomputed_scores_ctx",
-    "puerto_2.8b_ac":   "precomputed_scores_puerto_ac_ctx",
-    "extended_mimir":   "precomputed_scores_ctx",
+    "extended_2.8b":   "precomputed_scores_ctx",
+    "puerto_2.8b":     "precomputed_scores_puerto_ctx",
+    "extended_6.9b":   "precomputed_scores_6.9b_ctx",
+    "puerto_6.9b":     "precomputed_scores_puerto_6.9b_ctx",
+    "extended_mimir":  "precomputed_scores_ctx",
     # Per-classifier PCS variants (one classifier per file). Produced by
-    # precompute_one_classifier.py -- used when CV-tuning hadn't been done
-    # for a (model, ctx) and the bundled extended file was Puerto-only.
-    "lr_2.8b_ac":  "precomputed_scores_lr_ctx",
-    "svc_2.8b_ac": "precomputed_scores_svc_ctx",
-    "rf_2.8b_ac":  "precomputed_scores_rf_ctx",
-    "xgb_2.8b_ac": "precomputed_scores_xgb_ctx",
-    "mlp_2.8b_ac": "precomputed_scores_mlp_ctx",
-    "lr_6.9b":     "precomputed_scores_lr_6.9b_ctx",
-    "svc_6.9b":    "precomputed_scores_svc_6.9b_ctx",
-    "rf_6.9b":     "precomputed_scores_rf_6.9b_ctx",
-    "xgb_6.9b":    "precomputed_scores_xgb_6.9b_ctx",
-    "mlp_6.9b":    "precomputed_scores_mlp_6.9b_ctx",
+    # precompute_one_classifier.py for sklearn estimators and
+    # precompute_one_mlp.py for MLP.
+    "lr_2.8b":   "precomputed_scores_lr_ctx",
+    "svc_2.8b":  "precomputed_scores_svc_ctx",
+    "rf_2.8b":   "precomputed_scores_rf_ctx",
+    "xgb_2.8b":  "precomputed_scores_xgb_ctx",
+    "mlp_2.8b":  "precomputed_scores_mlp_ctx",
+    "lr_6.9b":   "precomputed_scores_lr_6.9b_ctx",
+    "svc_6.9b":  "precomputed_scores_svc_6.9b_ctx",
+    "rf_6.9b":   "precomputed_scores_rf_6.9b_ctx",
+    "xgb_6.9b":  "precomputed_scores_xgb_6.9b_ctx",
+    "mlp_6.9b":  "precomputed_scores_mlp_6.9b_ctx",
 }
 
-FC_DIR = os.environ.get(
-    "FC_DIR",
-    os.path.join(os.environ.get("MIA_ROOT", "./mia_scores"), "results", "first_chunk"),
+PCS_DIR = os.environ.get(
+    "PCS_DIR",
+    os.path.join(os.environ.get("MIA_ROOT", "./mia_scores"), "results", "pcs"),
 )
-FC_TYPES = {"puerto_fc", "extended_fc", "mlp_fc"}
-
-ALL_CHUNK_DIR = os.environ.get(
-    "ALL_CHUNK_DIR",
-    os.path.join(os.environ.get("MIA_ROOT", "./mia_scores"), "results", "all_chunk"),
-)
-ALL_CHUNK_TYPES = {"extended_6.9b", "puerto_6.9b",
-                   "extended_2.8b_ac", "puerto_2.8b_ac",
-                   "extended_mimir",
-                   # per-classifier variants -- live under <dataset>/per_classifier/
-                   "lr_2.8b_ac",  "svc_2.8b_ac",  "rf_2.8b_ac",  "xgb_2.8b_ac", "mlp_2.8b_ac",
-                   "lr_6.9b",     "svc_6.9b",     "rf_6.9b",     "xgb_6.9b",    "mlp_6.9b"}
-# Subset of ALL_CHUNK_TYPES whose files live in the per_classifier/ subdir
-# (one classifier per file -- produced by precompute_one_classifier.py
-# for sklearn estimators and precompute_one_mlp.py for MLP).
+# Variants whose files live under <dataset>/per_classifier/
+# (one classifier per file).
 PER_CLASSIFIER_TYPES = {
-    "lr_2.8b_ac",  "svc_2.8b_ac",  "rf_2.8b_ac",  "xgb_2.8b_ac", "mlp_2.8b_ac",
-    "lr_6.9b",     "svc_6.9b",     "rf_6.9b",     "xgb_6.9b",    "mlp_6.9b",
+    "lr_2.8b",  "svc_2.8b",  "rf_2.8b",  "xgb_2.8b", "mlp_2.8b",
+    "lr_6.9b",  "svc_6.9b",  "rf_6.9b",  "xgb_6.9b", "mlp_6.9b",
 }
 
 
 def load_pcs(dataset, ctx, train, seed, pcs_type):
     """Load a precomputed scores file."""
     prefix = PCS_PREFIXES[pcs_type]
-    if pcs_type in FC_TYPES:
-        path = f"{FC_DIR}/{dataset}/{prefix}{ctx}_train{train}_seed{seed}.json"
-    elif pcs_type in PER_CLASSIFIER_TYPES:
-        path = f"{ALL_CHUNK_DIR}/{dataset}/per_classifier/{prefix}{ctx}_train{train}_seed{seed}.json"
-    elif pcs_type in ALL_CHUNK_TYPES:
-        path = f"{ALL_CHUNK_DIR}/{dataset}/{prefix}{ctx}_train{train}_seed{seed}.json"
+    if pcs_type in PER_CLASSIFIER_TYPES:
+        path = f"{PCS_DIR}/{dataset}/per_classifier/{prefix}{ctx}_train{train}_seed{seed}.json"
     else:
-        path = f"{OUT_DIR}/{dataset}/brunner_munzel/{prefix}{ctx}_train{train}_seed{seed}.json"
+        path = f"{PCS_DIR}/{dataset}/{prefix}{ctx}_train{train}_seed{seed}.json"
     if not os.path.exists(path):
         return None
     with open(path) as f:
@@ -261,8 +237,7 @@ def evaluate_collection(pcs, model_name, coll_size, seed,
 def subsample_known(pcs, known_size, seed):
     """Subsample known scores by document index, matching aggregate.py's
     np.random.RandomState(seed).permutation approach.
-    For first-chunk PCS: 1 score = 1 doc, so subsample directly.
-    For multi-paragraph PCS: scores are flattened, subsample first N scores
+    Scores are flattened, subsample first N scores
     (approximation; exact doc-level subsampling would need doc boundaries).
     """
     total_known = len(list(pcs["known_scores"].values())[0])
@@ -372,12 +347,8 @@ def main():
                         default=[1000, 500, 200, 100, 50, 10])
     parser.add_argument("--seed", type=int, default=None,
                         help="Single seed, or all 5 if omitted")
-    parser.add_argument("--pcs_type", type=str, default="extended",
-                        choices=["extended", "puerto", "mlp",
-                                 "puerto_fc", "extended_fc", "mlp_fc",
-                                 "extended_6.9b", "puerto_6.9b",
-                                 "extended_2.8b_ac", "puerto_2.8b_ac",
-                                 "extended_mimir"])
+    parser.add_argument("--pcs_type", type=str, default="extended_2.8b",
+                        choices=list(PCS_PREFIXES.keys()))
     parser.add_argument("--doc_test", type=str, default="mwu",
                         choices=["mwu", "bm"],
                         help="Document-level test: mwu (Mann-Whitney U) or bm (Brunner-Munzel)")

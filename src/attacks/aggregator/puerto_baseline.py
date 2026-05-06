@@ -9,10 +9,8 @@ For each seed:
 3. Score every paragraph in eval members + eval non-members
 4. Save scores + metadata for downstream aggregation
 
-Output per dataset:
-  precomputed_scores_puerto_ac_ctx{CTX}_train{N_TRAIN}_seed{SEED}.json
 
-Usage:
+Example Usage:
     python precompute_paragraph_scores_puerto.py --dataset arxiv --seed 670487
     python precompute_paragraph_scores_puerto.py --dataset arxiv  # all 5 seeds
 """
@@ -69,7 +67,7 @@ def extract_puerto_features(paragraphs):
 
 
 def train_linear_model(X_train, y_train):
-    """Train nn.Linear with Adam (Puerto's original method) with outlier removal."""
+    """Train nn.Linear with Adam (Puerto's original method, see https://github.com/parameterlab/mia-scaling/tree/main) with outlier removal."""
     # Remove top/bottom 2.5%
     sort_idx = np.argsort(X_train[:, 0])
     n = len(sort_idx)
@@ -100,14 +98,12 @@ def train_linear_model(X_train, y_train):
 
     return model, device
 
-
 def get_scores(model, X, device):
     """Get raw model scores."""
     model.eval()
     with torch.no_grad():
         X_t = torch.tensor(X, dtype=torch.float32).to(device)
         return model(X_t).squeeze(-1).cpu().numpy().tolist()
-
 
 def run_seed(dataset, seed, members, non_members):
     print(f"\n  --- Seed {seed} ---")
@@ -218,9 +214,6 @@ def main():
             json.dump(result, f)
         print(f"    Saved to {out_path}")
         print(f"    File size: {os.path.getsize(out_path) / 1e6:.1f} MB")
-
-    print("\nDone!")
-
 
 if __name__ == "__main__":
     main()

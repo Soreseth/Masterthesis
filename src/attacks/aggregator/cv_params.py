@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
 """
-Stage 2 of the aggregator pipeline: GridSearchCV per (dataset, ctx) on the
+Find the most optimal hyperparameter for the aggregator on the training dataset with GridSearchCV per (dataset, ctx) on the
 classifiers shortlisted by ``motivation_lazypredict.py``.
 
-Inputs:
-    configs/lazypredict_shortlist.json     (which classifiers to tune)
-    configs/cv_grids.yaml                  (per-classifier search grids)
-    $MIA_ROOT/<subset>/undefended/<model>/ctx<CTX>/{members,nonmembers}.jsonl
-
-Outputs:
-    configs/cv_params/<pythia_model>_<dataset>_<ctx>.json
-        e.g. {"LogisticRegression": {"C": 0.01, "penalty": "l1", "solver": "saga"}, ...}
-    The committed JSONs in this directory are the ones that back the thesis
-    tables; new runs overwrite the matching file in place.
-
-Usage:
+Example Usage:
     python -m src.attacks.aggregator.cv_params \\
         --dataset arxiv --ctx 1024 --pythia_model pythia-2.8b
 """

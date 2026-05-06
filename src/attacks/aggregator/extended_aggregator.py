@@ -2,13 +2,7 @@
 """
 Precompute per-paragraph MIA scores using ALL chunks per document with extended features.
 
-Same as precompute_paragraph_scores.py but:
-- No max_docs cap (loads all available documents)
-- Saves to results/all_chunk/{dataset}/
-
-Output: results/all_chunk/{dataset}/precomputed_scores_ctx{CTX}_train{N_TRAIN}_seed{SEED}.json
-
-Usage:
+Example Usage:
     python precompute_paragraph_scores_all_chunk.py --dataset arxiv --seed 670487 --ctx 2048
 """
 import sys, os, json, re, argparse
@@ -110,10 +104,6 @@ def run_seed(dataset, seed, members, non_members, cv_params):
     config = {
         "n_train_docs": N_TRAIN,
         "n_known_docs": N_KNOWN,
-        # Fix the training pool at max(N_TRAIN, 1000) so smaller train
-        # sizes get subsampled FROM the same 1000-doc pool used at the
-        # largest train size. Without this, every (N_TRAIN) PCS file
-        # uses a different doc slice and a different eval boundary.
         "n_train_docs_sweep": [max(N_TRAIN, 1000)],
         "n_known_docs_sweep": [N_KNOWN],
     }

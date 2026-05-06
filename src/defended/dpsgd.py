@@ -11,7 +11,7 @@ Continual fine-tuning scenario:
 Hyperparameters (from ScaleUP paper):
   - LoRA: r=64, alpha=16, dropout=0.1, target_modules=query_key_value
   - Training: batch_size=8, grad_accum=4, epochs=4, lr=2e-5
-  - Block size: 1024 tokens (truncated, no chunking)
+  - Block size: 1024 tokens (chunked, every chunk kept)
   - DP: automatic clipping, MixOpt (Ghost Clipping)
 
 Diagnostic additions (2026-04-18):
@@ -87,30 +87,8 @@ def load_defense_data(dataset):
     return train_ds, eval_ds
 
 
-def tokenize_truncate(dataset, tokenizer, max_length=BLOCK_SIZE):
-    """Tokenize and truncate each document to max_length. One sequence per document."""
-    def tok_fn(examples):
-        result = tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-            return_tensors=None,
-        )
-        result["labels"] = [
-            [tok if tok != tokenizer.pad_token_id else -100 for tok in ids]
-            for ids in result["input_ids"]
-        ]
-        return result
-
-    return dataset.map(
-        tok_fn, batched=True,
-        remove_columns=dataset.column_names,
-    )
-
-
-def tokenize_all_chunks(dataset, tokenizer, block_size=BLOCK_SIZE,
-                        min_tail_tokens=None):
+def tokenize_chunks(dataset, tokenizer, block_size=BLOCK_SIZE,
+                    min_tail_tokens=None):
     """Tokenize each document, then split into block_size-token chunks
     (no truncation, every chunk kept). Tail chunks shorter than
     min_tail_tokens are dropped (default: block_size // 4) so we don't
@@ -118,9 +96,7 @@ def tokenize_all_chunks(dataset, tokenizer, block_size=BLOCK_SIZE,
 
     Returns one row per (doc, chunk_offset) pair. The DP sample_size
     therefore counts CHUNKS, not docs -- neighbouring datasets in the DP
-    sense differ by one chunk, not one document. This is a weaker
-    per-document privacy guarantee than the truncate mode but exposes
-    more of each document to the optimizer.
+    sense differ by one chunk, not one document.
     """
     if min_tail_tokens is None:
         min_tail_tokens = max(1, block_size // 4)
@@ -194,15 +170,10 @@ def main():
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--block-size", type=int, default=BLOCK_SIZE)
     parser.add_argument("--lora-rank", type=int, default=LORA_RANK)
-    parser.add_argument("--chunking-mode", type=str, default="truncate",
-                        choices=["truncate", "all_chunks"],
-                        help="truncate: one block_size sample per doc (default, original behavior). "
-                             "all_chunks: split each doc into block_size chunks; sample_size grows "
-                             "by avg-chunks-per-doc, DP guarantee shifts from per-document to per-chunk.")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR,
                         help=f"Override the model save root. Default: {OUTPUT_DIR}. "
-                             "Use a different root when changing block-size or chunking-mode "
-                             "to avoid mixing runs from incompatible configs in the same dir.")
+                             "Use a different root when changing block-size to avoid "
+                             "mixing runs from incompatible configs in the same dir.")
     parser.add_argument("--diag-steps", type=int, default=50,
                         help="Log per-step loss and grad norm for the first N batches.")
     parser.add_argument("--resume-from", type=str, default=None,
@@ -220,9 +191,8 @@ def main():
     # Model name for saving
     eps_str = f"eps{epsilon}" if is_dp else "epsinf"
     timestamp = datetime.now().strftime("%m%d-%H%M")
-    chunk_tag = "trunc" if args.chunking_mode == "truncate" else "ac"
     model_name = (f"defense_dplora_{eps_str}_r{args.lora_rank}_a{LORA_ALPHA}_"
-                  f"bs{args.block_size}_{chunk_tag}_{timestamp}")
+                  f"bs{args.block_size}_{timestamp}")
 
     print(f"\n{'='*60}")
     print(f"  DPSGD Defense (DP-LoRA + fastDP Ghost Clipping)")
@@ -278,19 +248,14 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f"LoRA: {trainable:,} trainable / {total:,} total params ({100*trainable/total:.2f}%)")
 
-    # Load and tokenize data -- truncate (1 sample/doc) or all_chunks (N samples/doc)
+    # Load and tokenize data -- N samples/doc (block_size chunks)
     train_ds, val_ds = load_defense_data(args.dataset)
-    if args.chunking_mode == "all_chunks":
-        train_tok = tokenize_all_chunks(train_ds, tokenizer, args.block_size)
-        val_tok = tokenize_all_chunks(val_ds, tokenizer, args.block_size)
-        sample_descr = (
-            f"all_chunks @ block_size={args.block_size} "
-            f"(avg ~{len(train_tok) / max(1, len(train_ds)):.1f} chunks/doc)"
-        )
-    else:
-        train_tok = tokenize_truncate(train_ds, tokenizer, args.block_size)
-        val_tok = tokenize_truncate(val_ds, tokenizer, args.block_size)
-        sample_descr = f"truncate @ block_size={args.block_size} (1 per doc)"
+    train_tok = tokenize_chunks(train_ds, tokenizer, args.block_size)
+    val_tok = tokenize_chunks(val_ds, tokenizer, args.block_size)
+    sample_descr = (
+        f"block_size={args.block_size} "
+        f"(avg ~{len(train_tok) / max(1, len(train_ds)):.1f} chunks/doc)"
+    )
 
     train_tok.set_format("torch")
     val_tok.set_format("torch")

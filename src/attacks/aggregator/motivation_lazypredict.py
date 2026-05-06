@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 """
-Stage 1 of the aggregator pipeline: run lazypredict on the 644-feature MIA
+Screening process for aggregation methods: run lazypredict on the 644-feature MIA
 matrix to identify which sklearn-compatible classifiers separate members from
 non-members at all. The shortlist is consumed by ``cv_params.py`` to focus
 GridSearchCV only on classifiers worth tuning.
 
-Outputs:
-    configs/lazypredict_shortlist.json
-        ["LogisticRegression", "SVC", "RandomForest", "XGBoost", "MLP", ...]
-    paper/tables/lazypredict_ranking_<dataset>_ctx<CTX>.tex
-        ranking table for the thesis appendix
-
-Inputs:
-    Merged MIA score JSONL files at:
-        $MIA_ROOT/<subset>/undefended/pythia-2.8b/ctx<CTX>/members.jsonl
-        $MIA_ROOT/<subset>/undefended/pythia-2.8b/ctx<CTX>/nonmembers.jsonl
-
-Usage:
+Example Usage:
     python -m src.attacks.aggregator.motivation_lazypredict \\
         --dataset arxiv --ctx 1024 --pythia_model pythia-2.8b
 """
