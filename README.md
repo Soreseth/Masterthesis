@@ -1,8 +1,8 @@
 # Enhanced Membership Inference Attacks through Statistical Score Aggregation in Large Language Models
 
-**Author:** Abinash Selvarajah  
-**Institution:** Ruhr-University Bochum, Chair for Trustworthy Human Language Technologies
-**Year:** 2026
+**Author:** *Abinash Selvarajah*  
+**Institution:** *Ruhr-University Bochum, Chair for Trustworthy Human Language Technologies*
+**Year:** *2026*
 ---
 
 ## Abstract
